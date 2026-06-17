@@ -11,7 +11,14 @@ struct DiagnoseState {
 static DIAGNOSE_STATE: OnceLock<DiagnoseState> = OnceLock::new();
 
 pub fn init() -> Result<PathBuf, String> {
-    let path = std::env::temp_dir().join("claude-code-usage-monitor.log");
+    // Place the log in the user-private AppData\Local temp directory rather than
+    // a potentially shared system temp directory.
+    let log_dir = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| Some(std::env::temp_dir()))
+        .ok_or_else(|| "Unable to determine a writable log directory".to_string())?;
+
+    let path = log_dir.join("claude-code-usage-monitor.log");
     let file = OpenOptions::new()
         .create(true)
         .write(true)

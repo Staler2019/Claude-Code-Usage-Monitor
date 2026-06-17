@@ -598,18 +598,27 @@ fn fetch_usage_via_messages(token: &str) -> Result<UsageData, PollError> {
     Err(PollError::RequestFailed)
 }
 
+fn clamp_utilization(raw: f64) -> f64 {
+    if raw.is_nan() || raw.is_infinite() || raw < 0.0 {
+        return 0.0;
+    }
+    raw.min(1.0)
+}
+
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
     data.session.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization") * 100.0;
+        clamp_utilization(get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization"))
+            * 100.0;
     data.session.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-5h-reset",
     ));
 
     data.weekly.percentage =
-        get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization") * 100.0;
+        clamp_utilization(get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization"))
+            * 100.0;
     data.weekly.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-7d-reset",
@@ -710,7 +719,11 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     if secs < 0 {
         return None;
     }
-    Some(UNIX_EPOCH + Duration::from_secs(secs as u64))
+    // Reject timestamps beyond year 2200 — clearly invalid API data.
+    if secs > 7_258_118_400 {
+        return None;
+    }
+    UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
 }
 
 struct Credentials {
@@ -739,10 +752,27 @@ fn read_first_credentials() -> Option<Credentials> {
     None
 }
 
+fn path_is_symlink(path: &std::path::Path) -> bool {
+    std::fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
 fn read_windows_credentials() -> Option<Credentials> {
     let CredentialSource::Windows(cred_path) = windows_credential_source()? else {
         return None;
     };
+
+    // Refuse to follow symlinks — a symlink could redirect reads to an
+    // attacker-controlled location, or be used to exfiltrate credentials.
+    if path_is_symlink(&cred_path) || path_is_symlink(cred_path.parent().unwrap_or(&cred_path)) {
+        diagnose::log(format!(
+            "refusing to read credentials: symlink detected at {}",
+            cred_path.display()
+        ));
+        return None;
+    }
+
     let content = match std::fs::read_to_string(&cred_path) {
         Ok(content) => content,
         Err(error) => {
@@ -841,6 +871,16 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         .to_string();
     let expires_at = oauth.get("expiresAt").and_then(|v| v.as_i64());
 
+    // Reject obviously invalid tokens
+    if access_token.is_empty() || access_token.len() > 8192 {
+        diagnose::log("credential file contains an invalid access token (unexpected length)");
+        return None;
+    }
+    if !access_token.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+        diagnose::log("credential file contains an access token with unexpected characters");
+        return None;
+    }
+
     Some(Credentials {
         access_token,
         expires_at,
@@ -874,6 +914,16 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
     None
 }
 
+fn is_safe_wsl_distro_name(name: &str) -> bool {
+    // Distro names from WSL should only contain alphanumerics, spaces, hyphens,
+    // underscores, and dots. Reject anything that looks like shell metacharacters.
+    !name.is_empty()
+        && name.len() <= 256
+        && name
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
+}
+
 fn list_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
         Command::new("wsl.exe")
@@ -895,6 +945,14 @@ fn list_wsl_distros() -> Vec<String> {
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
+        .filter(|name| {
+            if is_safe_wsl_distro_name(name) {
+                true
+            } else {
+                diagnose::log(format!("skipping WSL distro with unexpected name: {name:?}"));
+                false
+            }
+        })
         .map(ToOwned::to_owned)
         .collect()
 }
@@ -987,6 +1045,16 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let month: u64 = date_parts[1].parse().map_err(|_| ())?;
     let day: u64 = date_parts[2].parse().map_err(|_| ())?;
 
+    if !(1970..=9999).contains(&year) {
+        return Err(());
+    }
+    if !(1..=12).contains(&month) {
+        return Err(());
+    }
+    if !(1..=31).contains(&day) {
+        return Err(());
+    }
+
     // Strip fractional seconds
     let time_base = time_str.split('.').next().unwrap_or(time_str);
     let time_parts: Vec<&str> = time_base.split(':').collect();
@@ -997,6 +1065,10 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
     let hour: u64 = time_parts[0].parse().map_err(|_| ())?;
     let min: u64 = time_parts[1].parse().map_err(|_| ())?;
     let sec: u64 = time_parts[2].parse().map_err(|_| ())?;
+
+    if hour > 23 || min > 59 || sec > 60 {
+        return Err(());
+    }
 
     // Days from year (using a simplified calculation for dates after 1970)
     let mut days: u64 = 0;

@@ -247,12 +247,23 @@ fn default_show_codex() -> bool {
     false
 }
 
+const MIN_POLL_INTERVAL_MS: u32 = 60_000;
+const MAX_POLL_INTERVAL_MS: u32 = 24 * 60 * 60 * 1000;
+
 fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
         Err(_) => return SettingsFile::default(),
     };
     let mut settings: SettingsFile = serde_json::from_str(&content).unwrap_or_default();
+
+    // Clamp poll interval to a safe range to prevent accidental or malicious DoS
+    // (polling too fast) or missed updates (polling never).
+    settings.poll_interval_ms = settings
+        .poll_interval_ms
+        .max(MIN_POLL_INTERVAL_MS)
+        .min(MAX_POLL_INTERVAL_MS);
+
     if !settings.show_claude_code && !settings.show_codex {
         settings.show_claude_code = true;
     }
