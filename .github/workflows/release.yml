@@ -19,21 +19,30 @@ jobs:
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Build release binary
-        run: cargo build --release
-
-      - name: Get version from Cargo.toml
-        id: version
+      - name: Check if version was bumped
+        id: check_version
         shell: bash
         run: |
-          VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
-          echo "version=v$VERSION" >> $GITHUB_OUTPUT
+          CURRENT=$(grep -m1 '^version' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+          PREVIOUS=$(git show HEAD^:Cargo.toml 2>/dev/null | grep -m1 '^version' | sed 's/version = "\(.*\)"/\1/' || echo "0.0.0")
+          echo "current=v$CURRENT" >> $GITHUB_OUTPUT
+          if [ "$(printf '%s\n' "$PREVIOUS" "$CURRENT" | sort -V | tail -1)" = "$CURRENT" ] && [ "$CURRENT" != "$PREVIOUS" ]; then
+            echo "bumped=true" >> $GITHUB_OUTPUT
+          else
+            echo "bumped=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.check_version.outputs.bumped == 'true'
+
+      - name: Build release binary
+        if: steps.check_version.outputs.bumped == 'true'
+        run: cargo build --release
 
       - name: Create GitHub Release
+        if: steps.check_version.outputs.bumped == 'true'
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.version.outputs.version }}
+          tag_name: ${{ steps.check_version.outputs.current }}
           files: target/release/claude-code-usage-monitor.exe
           generate_release_notes: true
