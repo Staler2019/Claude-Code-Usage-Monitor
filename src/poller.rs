@@ -413,7 +413,7 @@ fn build_agent() -> Result<ureq::Agent, PollError> {
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
     let sources = match mode {
         CredentialWatchMode::ActiveSource => read_first_credentials()
-            .map(|creds| vec![creds.source])
+            .map(|creds| vec![creds.source.clone()])
             .unwrap_or_else(all_known_credential_sources),
         CredentialWatchMode::AllSources => all_known_credential_sources(),
     };
