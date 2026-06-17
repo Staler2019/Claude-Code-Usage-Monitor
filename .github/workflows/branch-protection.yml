@@ -1,0 +1,31 @@
+name: Setup Branch Protection
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  protect:
+    runs-on: ubuntu-latest
+    permissions:
+      administration: write
+    steps:
+      - name: Require CI to pass before merging
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.repos.updateBranchProtection({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              branch: 'main',
+              required_status_checks: {
+                strict: false,
+                checks: [{ context: 'build' }]
+              },
+              enforce_admins: false,
+              required_pull_request_reviews: null,
+              restrictions: null
+            });
+            console.log('Branch protection set: CI must pass before merging into main.');
