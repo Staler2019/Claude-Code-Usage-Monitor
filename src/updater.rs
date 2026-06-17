@@ -57,6 +57,18 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
         let source = PathBuf::from(&args[3]);
         let pid = args[4].parse::<u32>().unwrap_or(0);
 
+        // Validate that both paths are absolute and contain no traversal components.
+        // This flag is for internal use only (spawned by begin_self_update), but
+        // a compromised caller could supply paths designed to overwrite arbitrary files.
+        if !target.is_absolute() || !source.is_absolute() {
+            show_error_message("Update failed", "Update paths must be absolute.");
+            return Some(1);
+        }
+        if args[2].contains("..") || args[3].contains("..") {
+            show_error_message("Update failed", "Update paths must not contain '..'.");
+            return Some(1);
+        }
+
         return Some(match apply_update(target, source, pid) {
             Ok(()) => 0,
             Err(error) => {
