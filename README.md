@@ -1,5 +1,6 @@
 ![Windows](https://img.shields.io/badge/platform-Windows-blue)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![CI](https://github.com/Staler2019/Claude-Code-Usage-Monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/Staler2019/Claude-Code-Usage-Monitor/actions/workflows/ci.yml)
 
 # Claude Code Usage Monitor
 
@@ -38,20 +39,14 @@ If you use Claude Code through WSL, that is supported too. The monitor can read 
 
 ## Install
 
-Install the latest version from WinGet:
-
-```powershell
-winget install CodeZeno.ClaudeCodeUsageMonitor
-```
-
-If you prefer not to use WinGet, you can still download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/CodeZeno/Claude-Code-Usage-Monitor/releases) page and run it directly.
+Download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/Staler2019/Claude-Code-Usage-Monitor/releases) page and run it directly.
 
 ## Use
 
-After installing with WinGet, run:
+After downloading, double-click the exe or run it from a terminal:
 
 ```powershell
-claude-code-usage-monitor
+.\claude-code-usage-monitor.exe
 ```
 
 Once running, it will appear in your taskbar and as one or more tray icons in the notification area.
@@ -91,7 +86,7 @@ claude-code-usage-monitor --diagnose
 This writes a log file to:
 
 ```text
-%TEMP%\claude-code-usage-monitor.log
+%LOCALAPPDATA%\claude-code-usage-monitor.log
 ```
 
 Settings are saved to:
@@ -143,6 +138,18 @@ What it does **not** do:
 - It does not collect analytics or telemetry
 - It does not upload your project files
 - It does not directly edit your Codex credentials file
+
+Security hardening details:
+
+- OAuth access tokens are **zeroed from heap memory** when no longer in use, reducing exposure in crash dumps or memory inspection tools
+- WSL distro names are validated against a safe-character allowlist to reject names with shell metacharacters
+- Symlinks on the Windows credential file and its parent directory are detected and refused, preventing symlink-based credential redirection attacks
+- Access token values are validated (ASCII-only, 1–8192 chars) to reject obviously corrupt or tampered credential files
+- Rate-limit utilization values from the API are clamped to [0, 1] to guard against NaN or malformed responses
+- The built-in datetime parser enforces valid ranges on year, month, day, hour, minute, and second fields
+- Unix timestamps beyond year 2200 are capped, and overflow-safe arithmetic is used throughout
+- The `--apply-update` flag rejects non-absolute paths and any path containing `../` to prevent overwriting arbitrary files
+- The polling interval from settings is clamped to between 60 seconds and 24 hours, preventing rapid-polling DoS from a tampered settings file
 
 Notes:
 
