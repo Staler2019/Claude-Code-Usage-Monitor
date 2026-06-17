@@ -55,6 +55,12 @@ struct CodexTokenData {
     account_id: Option<String>,
 }
 
+impl Drop for CodexTokenData {
+    fn drop(&mut self) {
+        zero_string(&mut self.access_token);
+    }
+}
+
 #[derive(Deserialize)]
 struct CodexUsageResponse {
     rate_limit: Option<Option<Box<CodexRateLimitDetails>>>,
@@ -726,10 +732,30 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
     UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
 }
 
+/// Overwrite `s`'s heap allocation with zeros before it is freed so the bytes
+/// cannot be recovered from a subsequent heap or process memory dump.
+/// `write_volatile` prevents the compiler from treating this as dead-store and
+/// optimising it away.
+fn zero_string(s: &mut String) {
+    // SAFETY: We hold `&mut String` so there is no aliasing. The bytes remain
+    // allocated and valid until after this function returns and String::drop
+    // calls the allocator.
+    let bytes = unsafe { s.as_bytes_mut() };
+    for b in bytes.iter_mut() {
+        unsafe { std::ptr::write_volatile(b as *mut u8, 0u8) };
+    }
+}
+
 struct Credentials {
     access_token: String,
     expires_at: Option<i64>,
     source: CredentialSource,
+}
+
+impl Drop for Credentials {
+    fn drop(&mut self) {
+        zero_string(&mut self.access_token);
+    }
 }
 
 #[derive(Clone, Debug)]
