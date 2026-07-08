@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
@@ -17,20 +18,12 @@ const RELEASE_ASSET_NAME: &str = "claude-code-usage-monitor.exe";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-// Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstallChannel {
-    Portable,
-    Winget,
-}
 
 #[derive(Clone, Debug)]
 pub struct ReleaseDescriptor {
     pub latest_version: String,
     asset_url: String,
+    checksum_url: String,
 }
 
 #[derive(Debug)]
@@ -81,41 +74,11 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
     None
 }
 
-pub fn current_install_channel() -> InstallChannel {
-    match std::env::current_exe() {
-        Ok(path) if is_winget_install_path(&path) => InstallChannel::Winget,
-        _ => InstallChannel::Portable,
-    }
-}
-
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
     match fetch_latest_release()? {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
     }
-}
-
-pub fn begin_winget_update() -> Result<(), String> {
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Unable to determine the app directory for restart.".to_string())?;
-    let command = winget_upgrade_command(
-        std::process::id(),
-        &current_exe.to_string_lossy(),
-        &current_dir.to_string_lossy(),
-    );
-
-    Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-Command")
-        .arg(&command)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
-
-    Ok(())
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
@@ -142,6 +105,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     }
 
     download_release_asset(&release.asset_url, &partial_download_path, &download_path)?;
+    verify_download_checksum(&download_path, &release.checksum_url)?;
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -216,9 +180,20 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
             "No Windows executable asset was found in the latest release.".to_string()
         })?;
 
+    let checksum_name = format!("{RELEASE_ASSET_NAME}.sha256");
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(&checksum_name))
+        .ok_or_else(|| {
+            "No checksum file was found for the latest release; refusing to update without verification."
+                .to_string()
+        })?;
+
     Ok(Some(ReleaseDescriptor {
         latest_version,
         asset_url: asset.browser_download_url.clone(),
+        checksum_url: checksum_asset.browser_download_url.clone(),
     }))
 }
 
@@ -252,6 +227,64 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
 
     Ok(())
+}
+
+fn verify_download_checksum(path: &Path, checksum_url: &str) -> Result<(), String> {
+    let expected = fetch_expected_checksum(checksum_url)?;
+    let actual = sha256_hex_of_file(path)?;
+
+    if actual != expected {
+        let _ = std::fs::remove_file(path);
+        return Err(
+            "Downloaded update failed checksum verification and was discarded for your safety."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn fetch_expected_checksum(url: &str) -> Result<String, String> {
+    let agent = build_agent()?;
+    let response = agent
+        .get(url)
+        .set("User-Agent", user_agent())
+        .call()
+        .map_err(|e| format!("Unable to download the release checksum: {e}"))?;
+
+    let body = response
+        .into_string()
+        .map_err(|e| format!("Unable to read the release checksum: {e}"))?;
+
+    parse_checksum(&body)
+}
+
+fn parse_checksum(body: &str) -> Result<String, String> {
+    let hex = body
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "Release checksum file is empty.".to_string())?
+        .to_ascii_lowercase();
+
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Release checksum file has an unexpected format.".to_string());
+    }
+
+    Ok(hex)
+}
+
+fn sha256_hex_of_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|e| format!("Unable to read the downloaded update for verification: {e}"))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("Unable to hash the downloaded update: {e}"))?;
+
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
@@ -356,41 +389,6 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
-fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
-    let target = powershell_single_quoted(target);
-    let working_dir = powershell_single_quoted(working_dir);
-    let package_id = WINGET_PACKAGE_ID;
-
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'; ",
-            "$pidToWait = {pid}; ",
-            "$target = '{target}'; ",
-            "$workingDir = '{working_dir}'; ",
-            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} catch {{ }}; ",
-            "winget upgrade --id {package_id} --exact; ",
-            "$exitCode = $LASTEXITCODE; ",
-            "if ($exitCode -eq 0) {{ ",
-            "Start-Sleep -Seconds 2; ",
-            "Start-Process -FilePath $target -WorkingDirectory $workingDir; ",
-            "exit 0 ",
-            "}}; ",
-            "Write-Host ''; ",
-            "Write-Host 'WinGet update failed with exit code' $exitCode; ",
-            "Read-Host 'Press Enter to close'; ",
-            "exit $exitCode"
-        ),
-        pid = pid,
-        target = target,
-        working_dir = working_dir,
-        package_id = package_id,
-    )
-}
-
-fn powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn backup_path_for(target: &Path) -> PathBuf {
     let file_name = target
         .file_name()
@@ -434,59 +432,6 @@ fn github_repo() -> Result<(&'static str, &'static str), String> {
 
 fn user_agent() -> &'static str {
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
-}
-
-fn is_winget_install_path(path: &Path) -> bool {
-    let normalized_path = normalize_path(path);
-    winget_install_roots()
-        .into_iter()
-        .map(|root| normalize_path(&root))
-        .any(|root| normalized_path.starts_with(&root))
-}
-
-fn winget_install_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        roots.push(
-            PathBuf::from(local_app_data)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Packages"),
-        );
-    }
-
-    if let Ok(program_files) = std::env::var("ProgramFiles") {
-        roots.push(PathBuf::from(program_files).join("WinGet").join("Packages"));
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files\WinGet\Packages"));
-    }
-
-    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
-        roots.push(
-            PathBuf::from(program_files_x86)
-                .join("WinGet")
-                .join("Packages"),
-        );
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files (x86)\WinGet\Packages"));
-    }
-
-    roots
-}
-
-fn normalize_path(path: &Path) -> String {
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-
-    normalized
-        .strip_prefix("\\\\?\\unc\\")
-        .map(|rest| format!("\\\\{rest}"))
-        .or_else(|| normalized.strip_prefix("\\\\?\\").map(str::to_owned))
-        .unwrap_or(normalized)
 }
 
 fn is_version_newer(candidate: &str, current: &str) -> bool {
@@ -558,50 +503,59 @@ mod tests {
         assert_eq!(parse_version("a.b.c"), (0, 0, 0));
     }
 
-    // -- normalize_path --
+    // -- parse_checksum --
+
+    const KNOWN_SHA256_OF_ABC: &str =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
     #[test]
-    fn normalize_path_lowercases_and_converts_separators() {
+    fn parse_checksum_accepts_bare_hex() {
+        assert_eq!(parse_checksum(KNOWN_SHA256_OF_ABC).unwrap(), KNOWN_SHA256_OF_ABC);
+    }
+
+    #[test]
+    fn parse_checksum_accepts_sha256sum_format() {
+        let body = format!("{KNOWN_SHA256_OF_ABC}  claude-code-usage-monitor.exe\n");
+        assert_eq!(parse_checksum(&body).unwrap(), KNOWN_SHA256_OF_ABC);
+    }
+
+    #[test]
+    fn parse_checksum_is_case_insensitive() {
         assert_eq!(
-            normalize_path(Path::new("C:/Foo/Bar")),
-            "c:\\foo\\bar"
+            parse_checksum(&KNOWN_SHA256_OF_ABC.to_ascii_uppercase()).unwrap(),
+            KNOWN_SHA256_OF_ABC
         );
     }
 
     #[test]
-    fn normalize_path_strips_trailing_separator() {
-        assert_eq!(normalize_path(Path::new(r"C:\Foo\Bar\")), "c:\\foo\\bar");
+    fn parse_checksum_rejects_wrong_length() {
+        assert!(parse_checksum("deadbeef").is_err());
     }
 
     #[test]
-    fn normalize_path_strips_extended_length_prefix() {
-        assert_eq!(
-            normalize_path(Path::new(r"\\?\C:\Foo\Bar")),
-            "c:\\foo\\bar"
-        );
+    fn parse_checksum_rejects_non_hex_characters() {
+        let bad = "z".repeat(64);
+        assert!(parse_checksum(&bad).is_err());
     }
 
     #[test]
-    fn normalize_path_strips_extended_unc_prefix() {
-        assert_eq!(
-            normalize_path(Path::new(r"\\?\UNC\server\share")),
-            "\\\\server\\share"
-        );
+    fn parse_checksum_rejects_empty_body() {
+        assert!(parse_checksum("   ").is_err());
     }
 
-    // -- powershell_single_quoted --
+    // -- sha256_hex_of_file --
 
     #[test]
-    fn powershell_single_quoted_escapes_embedded_quotes() {
-        assert_eq!(powershell_single_quoted("it's a test"), "it''s a test");
-    }
-
-    #[test]
-    fn powershell_single_quoted_leaves_plain_text_untouched() {
-        assert_eq!(
-            powershell_single_quoted(r"C:\Program Files\App"),
-            r"C:\Program Files\App"
-        );
+    fn sha256_hex_of_file_matches_known_vector() {
+        let path = std::env::temp_dir().join(format!(
+            "ccum-sha256-test-{}-{}",
+            std::process::id(),
+            "sha256_hex_of_file_matches_known_vector"
+        ));
+        std::fs::write(&path, b"abc").unwrap();
+        let hash = sha256_hex_of_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(hash, KNOWN_SHA256_OF_ABC);
     }
 
     // -- backup_path_for --
@@ -626,7 +580,7 @@ mod tests {
     #[test]
     fn github_repo_parses_owner_and_repo_from_cargo_metadata() {
         let (owner, repo) = github_repo().unwrap();
-        assert_eq!(owner, "CodeZeno");
+        assert_eq!(owner, "Staler2019");
         assert_eq!(repo, "Claude-Code-Usage-Monitor");
     }
 
@@ -637,15 +591,5 @@ mod tests {
         let agent = user_agent();
         assert!(agent.starts_with("claude-code-usage-monitor/"));
         assert!(agent.ends_with(env!("CARGO_PKG_VERSION")));
-    }
-
-    // -- winget_upgrade_command --
-
-    #[test]
-    fn winget_upgrade_command_embeds_pid_and_escaped_paths() {
-        let command = winget_upgrade_command(1234, "C:\\it's\\app.exe", "C:\\it's");
-        assert!(command.contains("$pidToWait = 1234;"));
-        assert!(command.contains("C:\\it''s\\app.exe"));
-        assert!(command.contains(WINGET_PACKAGE_ID));
     }
 }
