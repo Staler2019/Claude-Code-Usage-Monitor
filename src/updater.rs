@@ -17,15 +17,6 @@ const RELEASE_ASSET_NAME: &str = "claude-code-usage-monitor.exe";
 const HELPER_EXE_NAME: &str = "updater-helper.exe";
 const DOWNLOAD_EXE_NAME: &str = "update-download.exe";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
-const CREATE_NEW_CONSOLE: u32 = 0x00000010;
-// Keep this aligned with the package identifier used in winget-pkgs.
-const WINGET_PACKAGE_ID: &str = "CodeZeno.ClaudeCodeUsageMonitor";
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InstallChannel {
-    Portable,
-    Winget,
-}
 
 #[derive(Clone, Debug)]
 pub struct ReleaseDescriptor {
@@ -81,41 +72,11 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
     None
 }
 
-pub fn current_install_channel() -> InstallChannel {
-    match std::env::current_exe() {
-        Ok(path) if is_winget_install_path(&path) => InstallChannel::Winget,
-        _ => InstallChannel::Portable,
-    }
-}
-
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
     match fetch_latest_release()? {
         Some(release) => Ok(UpdateCheckResult::Available(release)),
         None => Ok(UpdateCheckResult::UpToDate),
     }
-}
-
-pub fn begin_winget_update() -> Result<(), String> {
-    let current_exe =
-        std::env::current_exe().map_err(|e| format!("Unable to locate current executable: {e}"))?;
-    let current_dir = current_exe
-        .parent()
-        .ok_or_else(|| "Unable to determine the app directory for restart.".to_string())?;
-    let command = winget_upgrade_command(
-        std::process::id(),
-        &current_exe.to_string_lossy(),
-        &current_dir.to_string_lossy(),
-    );
-
-    Command::new("powershell.exe")
-        .arg("-NoLogo")
-        .arg("-Command")
-        .arg(&command)
-        .creation_flags(CREATE_NEW_CONSOLE)
-        .spawn()
-        .map_err(|e| format!("Unable to launch WinGet update command: {e}"))?;
-
-    Ok(())
 }
 
 pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
@@ -356,41 +317,6 @@ fn updates_dir() -> Result<PathBuf, String> {
         .ok_or_else(|| "Unable to resolve a writable local updates directory.".to_string())
 }
 
-fn winget_upgrade_command(pid: u32, target: &str, working_dir: &str) -> String {
-    let target = powershell_single_quoted(target);
-    let working_dir = powershell_single_quoted(working_dir);
-    let package_id = WINGET_PACKAGE_ID;
-
-    format!(
-        concat!(
-            "$ErrorActionPreference = 'Stop'; ",
-            "$pidToWait = {pid}; ",
-            "$target = '{target}'; ",
-            "$workingDir = '{working_dir}'; ",
-            "try {{ Wait-Process -Id $pidToWait -Timeout 30 -ErrorAction Stop }} catch {{ }}; ",
-            "winget upgrade --id {package_id} --exact; ",
-            "$exitCode = $LASTEXITCODE; ",
-            "if ($exitCode -eq 0) {{ ",
-            "Start-Sleep -Seconds 2; ",
-            "Start-Process -FilePath $target -WorkingDirectory $workingDir; ",
-            "exit 0 ",
-            "}}; ",
-            "Write-Host ''; ",
-            "Write-Host 'WinGet update failed with exit code' $exitCode; ",
-            "Read-Host 'Press Enter to close'; ",
-            "exit $exitCode"
-        ),
-        pid = pid,
-        target = target,
-        working_dir = working_dir,
-        package_id = package_id,
-    )
-}
-
-fn powershell_single_quoted(value: &str) -> String {
-    value.replace('\'', "''")
-}
-
 fn backup_path_for(target: &Path) -> PathBuf {
     let file_name = target
         .file_name()
@@ -434,59 +360,6 @@ fn github_repo() -> Result<(&'static str, &'static str), String> {
 
 fn user_agent() -> &'static str {
     concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"))
-}
-
-fn is_winget_install_path(path: &Path) -> bool {
-    let normalized_path = normalize_path(path);
-    winget_install_roots()
-        .into_iter()
-        .map(|root| normalize_path(&root))
-        .any(|root| normalized_path.starts_with(&root))
-}
-
-fn winget_install_roots() -> Vec<PathBuf> {
-    let mut roots = Vec::new();
-
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        roots.push(
-            PathBuf::from(local_app_data)
-                .join("Microsoft")
-                .join("WinGet")
-                .join("Packages"),
-        );
-    }
-
-    if let Ok(program_files) = std::env::var("ProgramFiles") {
-        roots.push(PathBuf::from(program_files).join("WinGet").join("Packages"));
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files\WinGet\Packages"));
-    }
-
-    if let Ok(program_files_x86) = std::env::var("ProgramFiles(x86)") {
-        roots.push(
-            PathBuf::from(program_files_x86)
-                .join("WinGet")
-                .join("Packages"),
-        );
-    } else {
-        roots.push(PathBuf::from(r"C:\Program Files (x86)\WinGet\Packages"));
-    }
-
-    roots
-}
-
-fn normalize_path(path: &Path) -> String {
-    let normalized = path
-        .to_string_lossy()
-        .replace('/', "\\")
-        .trim_end_matches('\\')
-        .to_ascii_lowercase();
-
-    normalized
-        .strip_prefix("\\\\?\\unc\\")
-        .map(|rest| format!("\\\\{rest}"))
-        .or_else(|| normalized.strip_prefix("\\\\?\\").map(str::to_owned))
-        .unwrap_or(normalized)
 }
 
 fn is_version_newer(candidate: &str, current: &str) -> bool {
@@ -558,52 +431,6 @@ mod tests {
         assert_eq!(parse_version("a.b.c"), (0, 0, 0));
     }
 
-    // -- normalize_path --
-
-    #[test]
-    fn normalize_path_lowercases_and_converts_separators() {
-        assert_eq!(
-            normalize_path(Path::new("C:/Foo/Bar")),
-            "c:\\foo\\bar"
-        );
-    }
-
-    #[test]
-    fn normalize_path_strips_trailing_separator() {
-        assert_eq!(normalize_path(Path::new(r"C:\Foo\Bar\")), "c:\\foo\\bar");
-    }
-
-    #[test]
-    fn normalize_path_strips_extended_length_prefix() {
-        assert_eq!(
-            normalize_path(Path::new(r"\\?\C:\Foo\Bar")),
-            "c:\\foo\\bar"
-        );
-    }
-
-    #[test]
-    fn normalize_path_strips_extended_unc_prefix() {
-        assert_eq!(
-            normalize_path(Path::new(r"\\?\UNC\server\share")),
-            "\\\\server\\share"
-        );
-    }
-
-    // -- powershell_single_quoted --
-
-    #[test]
-    fn powershell_single_quoted_escapes_embedded_quotes() {
-        assert_eq!(powershell_single_quoted("it's a test"), "it''s a test");
-    }
-
-    #[test]
-    fn powershell_single_quoted_leaves_plain_text_untouched() {
-        assert_eq!(
-            powershell_single_quoted(r"C:\Program Files\App"),
-            r"C:\Program Files\App"
-        );
-    }
-
     // -- backup_path_for --
 
     #[test]
@@ -637,15 +464,5 @@ mod tests {
         let agent = user_agent();
         assert!(agent.starts_with("claude-code-usage-monitor/"));
         assert!(agent.ends_with(env!("CARGO_PKG_VERSION")));
-    }
-
-    // -- winget_upgrade_command --
-
-    #[test]
-    fn winget_upgrade_command_embeds_pid_and_escaped_paths() {
-        let command = winget_upgrade_command(1234, "C:\\it's\\app.exe", "C:\\it's");
-        assert!(command.contains("$pidToWait = 1234;"));
-        assert!(command.contains("C:\\it''s\\app.exe"));
-        assert!(command.contains(WINGET_PACKAGE_ID));
     }
 }
