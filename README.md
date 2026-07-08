@@ -187,3 +187,11 @@ If the newer usage endpoint is unavailable, it can fall back to reading the rate
 This project is licensed under MIT.
 
 If you want to inspect the behavior or audit the code, everything is in this repository.
+
+## Author
+
+This fork is maintained by [Staler2019](https://github.com/Staler2019).
+
+## Special Thanks
+
+This project is a fork of [CodeZeno/Claude-Code-Usage-Monitor](https://github.com/CodeZeno/Claude-Code-Usage-Monitor) by [Craig Constable](https://codezeno.com.au). All credit for the original design and implementation goes to the original author — huge thanks for building and open-sourcing it.

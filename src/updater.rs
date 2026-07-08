@@ -626,7 +626,7 @@ mod tests {
     #[test]
     fn github_repo_parses_owner_and_repo_from_cargo_metadata() {
         let (owner, repo) = github_repo().unwrap();
-        assert_eq!(owner, "CodeZeno");
+        assert_eq!(owner, "Staler2019");
         assert_eq!(repo, "Claude-Code-Usage-Monitor");
     }
 
