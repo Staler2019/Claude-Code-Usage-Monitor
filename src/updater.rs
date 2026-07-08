@@ -520,3 +520,132 @@ fn show_error_message(title: &str, message: &str) {
 fn wide_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- is_version_newer / parse_version --
+
+    #[test]
+    fn is_version_newer_detects_greater_versions() {
+        assert!(is_version_newer("1.4.5", "1.4.4"));
+        assert!(is_version_newer("1.5.0", "1.4.9"));
+        assert!(is_version_newer("2.0.0", "1.9.9"));
+    }
+
+    #[test]
+    fn is_version_newer_false_for_equal_or_older_versions() {
+        assert!(!is_version_newer("1.4.4", "1.4.4"));
+        assert!(!is_version_newer("1.4.3", "1.4.4"));
+        assert!(!is_version_newer("1.3.9", "1.4.0"));
+    }
+
+    #[test]
+    fn parse_version_ignores_prerelease_suffix() {
+        assert_eq!(parse_version("1.4.5-beta.1"), (1, 4, 5));
+    }
+
+    #[test]
+    fn parse_version_defaults_missing_components_to_zero() {
+        assert_eq!(parse_version("1"), (1, 0, 0));
+        assert_eq!(parse_version("1.2"), (1, 2, 0));
+        assert_eq!(parse_version(""), (0, 0, 0));
+    }
+
+    #[test]
+    fn parse_version_defaults_unparseable_components_to_zero() {
+        assert_eq!(parse_version("a.b.c"), (0, 0, 0));
+    }
+
+    // -- normalize_path --
+
+    #[test]
+    fn normalize_path_lowercases_and_converts_separators() {
+        assert_eq!(
+            normalize_path(Path::new("C:/Foo/Bar")),
+            "c:\\foo\\bar"
+        );
+    }
+
+    #[test]
+    fn normalize_path_strips_trailing_separator() {
+        assert_eq!(normalize_path(Path::new(r"C:\Foo\Bar\")), "c:\\foo\\bar");
+    }
+
+    #[test]
+    fn normalize_path_strips_extended_length_prefix() {
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\C:\Foo\Bar")),
+            "c:\\foo\\bar"
+        );
+    }
+
+    #[test]
+    fn normalize_path_strips_extended_unc_prefix() {
+        assert_eq!(
+            normalize_path(Path::new(r"\\?\UNC\server\share")),
+            "\\\\server\\share"
+        );
+    }
+
+    // -- powershell_single_quoted --
+
+    #[test]
+    fn powershell_single_quoted_escapes_embedded_quotes() {
+        assert_eq!(powershell_single_quoted("it's a test"), "it''s a test");
+    }
+
+    #[test]
+    fn powershell_single_quoted_leaves_plain_text_untouched() {
+        assert_eq!(
+            powershell_single_quoted(r"C:\Program Files\App"),
+            r"C:\Program Files\App"
+        );
+    }
+
+    // -- backup_path_for --
+
+    #[test]
+    fn backup_path_for_appends_old_suffix() {
+        let target = Path::new(r"C:\apps\claude-code-usage-monitor.exe");
+        assert_eq!(
+            backup_path_for(target),
+            PathBuf::from(r"C:\apps\claude-code-usage-monitor.exe.old")
+        );
+    }
+
+    #[test]
+    fn backup_path_for_falls_back_when_file_name_missing() {
+        let target = Path::new(r"C:\");
+        assert_eq!(backup_path_for(target), PathBuf::from(r"C:\app.exe.old"));
+    }
+
+    // -- github_repo --
+
+    #[test]
+    fn github_repo_parses_owner_and_repo_from_cargo_metadata() {
+        let (owner, repo) = github_repo().unwrap();
+        assert_eq!(owner, "CodeZeno");
+        assert_eq!(repo, "Claude-Code-Usage-Monitor");
+    }
+
+    // -- user_agent --
+
+    #[test]
+    fn user_agent_includes_package_name_and_version() {
+        let agent = user_agent();
+        assert!(agent.starts_with("claude-code-usage-monitor/"));
+        assert!(agent.ends_with(env!("CARGO_PKG_VERSION")));
+    }
+
+    // -- winget_upgrade_command --
+
+    #[test]
+    fn winget_upgrade_command_embeds_pid_and_escaped_paths() {
+        let command = winget_upgrade_command(1234, "C:\\it's\\app.exe", "C:\\it's");
+        assert!(command.contains("$pidToWait = 1234;"));
+        assert!(command.contains("C:\\it''s\\app.exe"));
+        assert!(command.contains(WINGET_PACKAGE_ID));
+    }
+}

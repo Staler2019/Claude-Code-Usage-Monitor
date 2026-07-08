@@ -1195,3 +1195,321 @@ pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
         || data.codex.as_ref().is_some_and(is_past_reset)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::localization::LanguageId;
+
+    fn en() -> Strings {
+        LanguageId::English.strings()
+    }
+
+    // -- clamp_utilization --
+
+    #[test]
+    fn clamp_utilization_passes_through_normal_values() {
+        assert_eq!(clamp_utilization(0.0), 0.0);
+        assert_eq!(clamp_utilization(0.5), 0.5);
+        assert_eq!(clamp_utilization(1.0), 1.0);
+    }
+
+    #[test]
+    fn clamp_utilization_clamps_above_one() {
+        assert_eq!(clamp_utilization(1.5), 1.0);
+        assert_eq!(clamp_utilization(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_utilization_floors_negative_and_nan() {
+        assert_eq!(clamp_utilization(-0.5), 0.0);
+        assert_eq!(clamp_utilization(f64::NAN), 0.0);
+    }
+
+    // -- parse_iso8601 / parse_datetime_to_unix --
+
+    #[test]
+    fn parse_iso8601_returns_none_for_missing_input() {
+        assert!(parse_iso8601(None).is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_parses_utc_zulu_timestamp() {
+        let parsed = parse_iso8601(Some("2026-03-05T08:00:00Z")).unwrap();
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1772697600
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_parses_offset_timestamp_with_fractional_seconds() {
+        let parsed = parse_iso8601(Some("2026-03-05T08:00:00.321598+00:00")).unwrap();
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1772697600
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_malformed_input() {
+        assert!(parse_iso8601(Some("not-a-date")).is_none());
+        assert!(parse_iso8601(Some("2026-13-40T99:99:99")).is_none());
+    }
+
+    #[test]
+    fn parse_datetime_to_unix_matches_known_epoch_values() {
+        assert_eq!(parse_datetime_to_unix("1970-01-01T00:00:00", ""), Ok(0));
+        // 2000-03-01 accounts for the Feb 29 2000 leap day correctly.
+        assert_eq!(
+            parse_datetime_to_unix("2000-03-01T00:00:00", ""),
+            Ok(951868800)
+        );
+    }
+
+    // -- is_leap --
+
+    #[test]
+    fn is_leap_identifies_leap_years() {
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(1900));
+        assert!(!is_leap(2023));
+    }
+
+    // -- unix_to_system_time --
+
+    #[test]
+    fn unix_to_system_time_converts_valid_timestamp() {
+        let t = unix_to_system_time(Some(1000)).unwrap();
+        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1000);
+    }
+
+    #[test]
+    fn unix_to_system_time_rejects_none_negative_and_far_future() {
+        assert!(unix_to_system_time(None).is_none());
+        assert!(unix_to_system_time(Some(-1)).is_none());
+        assert!(unix_to_system_time(Some(7_258_118_401)).is_none());
+    }
+
+    // -- is_token_expired --
+
+    #[test]
+    fn is_token_expired_true_for_past_timestamp() {
+        assert!(is_token_expired(Some(1)));
+    }
+
+    #[test]
+    fn is_token_expired_false_for_far_future_timestamp() {
+        let far_future_ms = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            + 60_000;
+        assert!(!is_token_expired(Some(far_future_ms)));
+    }
+
+    #[test]
+    fn is_token_expired_false_when_missing() {
+        assert!(!is_token_expired(None));
+    }
+
+    // -- format_countdown_from_secs / time_until_display_change_from_secs --
+
+    #[test]
+    fn format_countdown_from_secs_picks_largest_unit() {
+        assert_eq!(format_countdown_from_secs(30, en()), format!("30{}", en().second_suffix));
+        assert_eq!(format_countdown_from_secs(90, en()), format!("1{}", en().minute_suffix));
+        assert_eq!(format_countdown_from_secs(3700, en()), format!("1{}", en().hour_suffix));
+        assert_eq!(format_countdown_from_secs(90_000, en()), format!("1{}", en().day_suffix));
+    }
+
+    #[test]
+    fn time_until_display_change_from_secs_ticks_to_next_bucket_boundary() {
+        // 90 seconds -> currently showing "1 minute", next change is when the
+        // minute count changes at 120s, i.e. in 30s (+1 for rounding safety).
+        assert_eq!(
+            time_until_display_change_from_secs(90),
+            Duration::from_secs(31)
+        );
+        // Under 60s counts down second by second.
+        assert_eq!(
+            time_until_display_change_from_secs(45),
+            Duration::from_secs(1)
+        );
+    }
+
+    // -- is_past_reset / app_is_past_reset --
+
+    #[test]
+    fn is_past_reset_true_when_reset_time_has_elapsed() {
+        let mut data = UsageData::default();
+        data.session.resets_at = Some(SystemTime::now() - Duration::from_secs(5));
+        assert!(is_past_reset(&data));
+    }
+
+    #[test]
+    fn is_past_reset_false_when_reset_time_is_future_or_absent() {
+        let mut data = UsageData::default();
+        data.session.resets_at = Some(SystemTime::now() + Duration::from_secs(3600));
+        assert!(!is_past_reset(&data));
+
+        let empty = UsageData::default();
+        assert!(!is_past_reset(&empty));
+    }
+
+    #[test]
+    fn app_is_past_reset_checks_both_apps() {
+        let mut past = UsageData::default();
+        past.weekly.resets_at = Some(SystemTime::now() - Duration::from_secs(1));
+
+        let data = AppUsageData {
+            codex: Some(past),
+            ..Default::default()
+        };
+        assert!(app_is_past_reset(&data));
+
+        let empty = AppUsageData::default();
+        assert!(!app_is_past_reset(&empty));
+    }
+
+    // -- codex_usage_from_response / codex_section_from_window --
+
+    #[test]
+    fn codex_usage_from_response_maps_windows_to_sections() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: Some(Some(Box::new(CodexRateLimitWindow {
+                    used_percent: 12.5,
+                    reset_at: 1000,
+                }))),
+                secondary_window: Some(Some(Box::new(CodexRateLimitWindow {
+                    used_percent: 60.0,
+                    reset_at: 2000,
+                }))),
+            }))),
+        };
+
+        let data = codex_usage_from_response(response).unwrap();
+        assert_eq!(data.session.percentage, 12.5);
+        assert_eq!(
+            data.session.resets_at.unwrap().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1000
+        );
+        assert_eq!(data.weekly.percentage, 60.0);
+    }
+
+    #[test]
+    fn codex_usage_from_response_none_when_rate_limit_missing() {
+        let response = CodexUsageResponse { rate_limit: None };
+        assert!(codex_usage_from_response(response).is_none());
+
+        let response_null = CodexUsageResponse {
+            rate_limit: Some(None),
+        };
+        assert!(codex_usage_from_response(response_null).is_none());
+    }
+
+    #[test]
+    fn codex_usage_from_response_defaults_missing_windows() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: None,
+                secondary_window: None,
+            }))),
+        };
+        let data = codex_usage_from_response(response).unwrap();
+        assert_eq!(data.session.percentage, 0.0);
+        assert_eq!(data.weekly.percentage, 0.0);
+    }
+
+    // -- is_safe_wsl_distro_name --
+
+    #[test]
+    fn is_safe_wsl_distro_name_accepts_typical_names() {
+        assert!(is_safe_wsl_distro_name("Ubuntu-22.04"));
+        assert!(is_safe_wsl_distro_name("Debian GNU_Linux"));
+    }
+
+    #[test]
+    fn is_safe_wsl_distro_name_rejects_empty_or_shell_metacharacters() {
+        assert!(!is_safe_wsl_distro_name(""));
+        assert!(!is_safe_wsl_distro_name("Ubuntu; rm -rf /"));
+        assert!(!is_safe_wsl_distro_name("$(whoami)"));
+        assert!(!is_safe_wsl_distro_name(&"a".repeat(257)));
+    }
+
+    // -- decode_utf16le / looks_like_utf16le / decode_wsl_text --
+
+    #[test]
+    fn decode_wsl_text_decodes_utf16le_with_bom() {
+        // 0xFF 0xFE is the little-endian UTF-16 BOM, followed by "hi" as UTF-16LE code units.
+        let mut bytes = vec![0xFF, 0xFE];
+        for ch in "hi".encode_utf16() {
+            bytes.extend_from_slice(&ch.to_le_bytes());
+        }
+        assert_eq!(decode_wsl_text(&bytes), "hi");
+    }
+
+    #[test]
+    fn decode_wsl_text_falls_back_to_utf8_for_plain_text() {
+        assert_eq!(decode_wsl_text(b"present|123|456"), "present|123|456");
+    }
+
+    #[test]
+    fn decode_wsl_text_handles_empty_input() {
+        assert_eq!(decode_wsl_text(b""), "");
+    }
+
+    // -- parse_credentials --
+
+    #[test]
+    fn parse_credentials_extracts_token_and_expiry() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"abc123","expiresAt":9999999999}}"#;
+        let creds = parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json")),
+        )
+        .unwrap();
+        assert_eq!(creds.access_token, "abc123");
+        assert_eq!(creds.expires_at, Some(9999999999));
+    }
+
+    #[test]
+    fn parse_credentials_rejects_missing_oauth_block() {
+        assert!(parse_credentials(
+            "{}",
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_invalid_json() {
+        assert!(parse_credentials(
+            "not json",
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_empty_token() {
+        let json = r#"{"claudeAiOauth":{"accessToken":""}}"#;
+        assert!(parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_control_characters_in_token() {
+        let json = "{\"claudeAiOauth\":{\"accessToken\":\"abc\\u0007def\"}}";
+        assert!(parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+}
