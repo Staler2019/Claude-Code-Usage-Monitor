@@ -39,10 +39,19 @@ jobs:
         if: steps.check_version.outputs.bumped == 'true'
         run: cargo build --release
 
+      - name: Generate checksum
+        if: steps.check_version.outputs.bumped == 'true'
+        shell: pwsh
+        run: |
+          $hash = (Get-FileHash -Algorithm SHA256 -Path "target/release/${env:RELEASE_ASSET_NAME}").Hash.ToLower()
+          Set-Content -Path "target/release/${env:RELEASE_ASSET_NAME}.sha256" -Value $hash -NoNewline -Encoding ascii
+
       - name: Create GitHub Release
         if: steps.check_version.outputs.bumped == 'true'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.check_version.outputs.current }}
-          files: target/release/claude-code-usage-monitor.exe
+          files: |
+            target/release/${{ env.RELEASE_ASSET_NAME }}
+            target/release/${{ env.RELEASE_ASSET_NAME }}.sha256
           generate_release_notes: true

@@ -6,6 +6,7 @@ use std::process::Command;
 use std::time::Duration;
 
 use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
@@ -22,6 +23,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 pub struct ReleaseDescriptor {
     pub latest_version: String,
     asset_url: String,
+    checksum_url: String,
 }
 
 #[derive(Debug)]
@@ -103,6 +105,7 @@ pub fn begin_self_update(release: &ReleaseDescriptor) -> Result<(), String> {
     }
 
     download_release_asset(&release.asset_url, &partial_download_path, &download_path)?;
+    verify_download_checksum(&download_path, &release.checksum_url)?;
     std::fs::copy(&current_exe, &helper_path)
         .map_err(|e| format!("Unable to prepare updater helper: {e}"))?;
 
@@ -177,9 +180,20 @@ fn fetch_latest_release() -> Result<Option<ReleaseDescriptor>, String> {
             "No Windows executable asset was found in the latest release.".to_string()
         })?;
 
+    let checksum_name = format!("{RELEASE_ASSET_NAME}.sha256");
+    let checksum_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name.eq_ignore_ascii_case(&checksum_name))
+        .ok_or_else(|| {
+            "No checksum file was found for the latest release; refusing to update without verification."
+                .to_string()
+        })?;
+
     Ok(Some(ReleaseDescriptor {
         latest_version,
         asset_url: asset.browser_download_url.clone(),
+        checksum_url: checksum_asset.browser_download_url.clone(),
     }))
 }
 
@@ -213,6 +227,64 @@ fn download_release_asset(url: &str, partial_path: &Path, final_path: &Path) -> 
         .map_err(|e| format!("Unable to finalize the downloaded update file: {e}"))?;
 
     Ok(())
+}
+
+fn verify_download_checksum(path: &Path, checksum_url: &str) -> Result<(), String> {
+    let expected = fetch_expected_checksum(checksum_url)?;
+    let actual = sha256_hex_of_file(path)?;
+
+    if actual != expected {
+        let _ = std::fs::remove_file(path);
+        return Err(
+            "Downloaded update failed checksum verification and was discarded for your safety."
+                .to_string(),
+        );
+    }
+
+    Ok(())
+}
+
+fn fetch_expected_checksum(url: &str) -> Result<String, String> {
+    let agent = build_agent()?;
+    let response = agent
+        .get(url)
+        .set("User-Agent", user_agent())
+        .call()
+        .map_err(|e| format!("Unable to download the release checksum: {e}"))?;
+
+    let body = response
+        .into_string()
+        .map_err(|e| format!("Unable to read the release checksum: {e}"))?;
+
+    parse_checksum(&body)
+}
+
+fn parse_checksum(body: &str) -> Result<String, String> {
+    let hex = body
+        .split_whitespace()
+        .next()
+        .ok_or_else(|| "Release checksum file is empty.".to_string())?
+        .to_ascii_lowercase();
+
+    if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("Release checksum file has an unexpected format.".to_string());
+    }
+
+    Ok(hex)
+}
+
+fn sha256_hex_of_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path)
+        .map_err(|e| format!("Unable to read the downloaded update for verification: {e}"))?;
+    let mut hasher = Sha256::new();
+    io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("Unable to hash the downloaded update: {e}"))?;
+
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
 }
 
 fn replace_target_binary(target: &Path, source: &Path) -> Result<(), String> {
@@ -429,6 +501,61 @@ mod tests {
     #[test]
     fn parse_version_defaults_unparseable_components_to_zero() {
         assert_eq!(parse_version("a.b.c"), (0, 0, 0));
+    }
+
+    // -- parse_checksum --
+
+    const KNOWN_SHA256_OF_ABC: &str =
+        "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
+    #[test]
+    fn parse_checksum_accepts_bare_hex() {
+        assert_eq!(parse_checksum(KNOWN_SHA256_OF_ABC).unwrap(), KNOWN_SHA256_OF_ABC);
+    }
+
+    #[test]
+    fn parse_checksum_accepts_sha256sum_format() {
+        let body = format!("{KNOWN_SHA256_OF_ABC}  claude-code-usage-monitor.exe\n");
+        assert_eq!(parse_checksum(&body).unwrap(), KNOWN_SHA256_OF_ABC);
+    }
+
+    #[test]
+    fn parse_checksum_is_case_insensitive() {
+        assert_eq!(
+            parse_checksum(&KNOWN_SHA256_OF_ABC.to_ascii_uppercase()).unwrap(),
+            KNOWN_SHA256_OF_ABC
+        );
+    }
+
+    #[test]
+    fn parse_checksum_rejects_wrong_length() {
+        assert!(parse_checksum("deadbeef").is_err());
+    }
+
+    #[test]
+    fn parse_checksum_rejects_non_hex_characters() {
+        let bad = "z".repeat(64);
+        assert!(parse_checksum(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_checksum_rejects_empty_body() {
+        assert!(parse_checksum("   ").is_err());
+    }
+
+    // -- sha256_hex_of_file --
+
+    #[test]
+    fn sha256_hex_of_file_matches_known_vector() {
+        let path = std::env::temp_dir().join(format!(
+            "ccum-sha256-test-{}-{}",
+            std::process::id(),
+            "sha256_hex_of_file_matches_known_vector"
+        ));
+        std::fs::write(&path, b"abc").unwrap();
+        let hash = sha256_hex_of_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(hash, KNOWN_SHA256_OF_ABC);
     }
 
     // -- backup_path_for --

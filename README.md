@@ -160,6 +160,7 @@ Security hardening details:
 - The built-in datetime parser enforces valid ranges on year, month, day, hour, minute, and second fields
 - Unix timestamps beyond year 2200 are capped, and overflow-safe arithmetic is used throughout
 - The `--apply-update` flag rejects non-absolute paths and any path containing `../` to prevent overwriting arbitrary files
+- Downloaded updates are verified against a SHA-256 checksum published alongside the release before being applied; a missing or mismatched checksum aborts the update
 - The polling interval from settings is clamped to between 60 seconds and 24 hours, preventing rapid-polling DoS from a tampered settings file
 
 Notes:
