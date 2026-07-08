@@ -9,7 +9,7 @@ use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -62,13 +62,8 @@ struct AppState {
     codex_session_text: String,
     codex_weekly_percent: f64,
     codex_weekly_text: String,
-    antigravity_session_percent: f64,
-    antigravity_session_text: String,
-    antigravity_weekly_percent: f64,
-    antigravity_weekly_text: String,
     show_claude_code: bool,
     show_codex: bool,
-    show_antigravity: bool,
 
     data: Option<AppUsageData>,
 
@@ -82,11 +77,9 @@ struct AppState {
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
-    taskbar_index: usize,
     tray_offset: i32,
     dragging: bool,
     drag_start_mouse_x: i32,
-    drag_start_client_x: i32,
     drag_start_offset: i32,
 
     widget_visible: bool,
@@ -129,15 +122,12 @@ const IDM_LANG_RUSSIAN: u16 = 49;
 const IDM_LANG_PORTUGUESE_BRAZIL: u16 = 50;
 const IDM_MODEL_CLAUDE_CODE: u16 = 60;
 const IDM_MODEL_CODEX: u16 = 61;
-const IDM_MODEL_ANTIGRAVITY: u16 = 62;
+
+const DIVIDER_HIT_ZONE: i32 = 13; // LEFT_DIVIDER_W + DIVIDER_RIGHT_MARGIN
 
 const WM_DPICHANGED_MSG: u32 = 0x02E0;
 const WM_APP_UPDATE_CHECK_COMPLETE: u32 = WM_APP + 2;
 const TRAY_ICON_UPDATE_REPOSITION_SUPPRESS_MS: u64 = 750;
-
-/// How often the watchdog thread polls for an explorer.exe restart (which
-/// recreates the taskbar and wipes our tray-icon registration).
-const TASKBAR_WATCH_INTERVAL_SECS: u64 = 2;
 
 static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -164,93 +154,6 @@ fn refresh_dpi() {
             CURRENT_DPI.store(dpi, Ordering::Relaxed);
         }
     }
-}
-
-/// Spacing below which two relaunches are treated as a storm (e.g. explorer.exe
-/// crash-looping); when detected we back off instead of spawning in a tight loop.
-const RELAUNCH_THROTTLE_SECS: u64 = 10;
-const RELAUNCH_BACKOFF_SECS: u64 = 30;
-/// Environment flag set on a relaunched child so it waits for the previous
-/// instance's single-instance mutex instead of exiting immediately.
-const ENV_RELAUNCH: &str = "CCUM_RELAUNCH";
-/// Unix timestamp (seconds) of the relaunch that spawned this process, passed to
-/// the child so it can detect a relaunch storm.
-const ENV_LAST_RELAUNCH_UNIX: &str = "CCUM_LAST_RELAUNCH_UNIX";
-
-/// Relaunch the widget as a fresh process after explorer.exe has restarted.
-///
-/// When the shell restarts it destroys our embedded child window outright (the
-/// window is gone, not merely orphaned - `IsWindow` returns false) and leaves
-/// the UI thread parked in `GetMessage` with no window to recreate in place.
-/// Spawning a clean new process - which re-embeds into the freshly created
-/// taskbar - and exiting this one is the robust recovery. The child is flagged
-/// via `ENV_RELAUNCH` so it waits for this instance's single-instance mutex to
-/// be released before taking over (see the guard in `run`).
-fn relaunch_self() {
-    // Back off if we are relaunching very soon after the relaunch that spawned
-    // us: that signals the shell is crash-looping, not a one-off restart.
-    let now = now_unix_secs();
-    let last = std::env::var(ENV_LAST_RELAUNCH_UNIX)
-        .ok()
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
-    if last != 0 && now.saturating_sub(last) < RELAUNCH_THROTTLE_SECS {
-        diagnose::log("relaunch storm detected; backing off before relaunching");
-        std::thread::sleep(Duration::from_secs(RELAUNCH_BACKOFF_SECS));
-    }
-
-    let exe = match std::env::current_exe() {
-        Ok(exe) => exe,
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to resolve current executable", error);
-            return;
-        }
-    };
-
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    match std::process::Command::new(exe)
-        .args(&args)
-        .env(ENV_RELAUNCH, "1")
-        .env(ENV_LAST_RELAUNCH_UNIX, now.to_string())
-        .spawn()
-    {
-        Ok(_) => {
-            diagnose::log("watchdog: relaunched fresh instance, exiting old one");
-            std::process::exit(0);
-        }
-        Err(error) => {
-            diagnose::log_error("watchdog: unable to spawn relaunched instance", error);
-        }
-    }
-}
-
-/// Detect explorer.exe restarts and recover from them.
-///
-/// Once explorer destroys the taskbar, our embedded child window is destroyed
-/// and the UI message loop is dead, so recovery cannot happen in-process. This
-/// dedicated thread (independent of the dead message loop) polls the taskbar
-/// handle and, when it changes, relaunches the widget as a fresh process.
-fn spawn_taskbar_watchdog() {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(Duration::from_secs(TASKBAR_WATCH_INTERVAL_SECS));
-        let stored = {
-            let state = lock_state();
-            state.as_ref().and_then(|s| s.taskbar_hwnd)
-        };
-        // Only relevant once we have embedded into a taskbar at least once.
-        let Some(old) = stored else {
-            continue;
-        };
-        let taskbars = native_interop::find_taskbars();
-        if !taskbars.is_empty() && !taskbars.iter().any(|taskbar| taskbar.hwnd == old) {
-            let new = taskbars[0].hwnd;
-            diagnose::log(format!(
-                "watchdog: taskbar changed old={:?} new={:?} -> relaunching",
-                old.0, new.0
-            ));
-            relaunch_self();
-        }
-    });
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
@@ -299,8 +202,6 @@ fn settings_path() -> PathBuf {
 struct SettingsFile {
     #[serde(default)]
     tray_offset: i32,
-    #[serde(default)]
-    taskbar_index: usize,
     #[serde(default = "default_poll_interval")]
     poll_interval_ms: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -313,22 +214,18 @@ struct SettingsFile {
     show_claude_code: bool,
     #[serde(default = "default_show_codex")]
     show_codex: bool,
-    #[serde(default = "default_show_antigravity")]
-    show_antigravity: bool,
 }
 
 impl Default for SettingsFile {
     fn default() -> Self {
         Self {
             tray_offset: 0,
-            taskbar_index: 0,
             poll_interval_ms: default_poll_interval(),
             language: None,
             last_update_check_unix: None,
             widget_visible: true,
             show_claude_code: true,
             show_codex: false,
-            show_antigravity: false,
         }
     }
 }
@@ -352,10 +249,6 @@ fn default_show_codex() -> bool {
 const MIN_POLL_INTERVAL_MS: u32 = 60_000;
 const MAX_POLL_INTERVAL_MS: u32 = 24 * 60 * 60 * 1000;
 
-fn default_show_antigravity() -> bool {
-    false
-}
-
 fn load_settings() -> SettingsFile {
     let content = match std::fs::read_to_string(settings_path()) {
         Ok(c) => c,
@@ -370,7 +263,7 @@ fn load_settings() -> SettingsFile {
         .max(MIN_POLL_INTERVAL_MS)
         .min(MAX_POLL_INTERVAL_MS);
 
-    if !settings.show_claude_code && !settings.show_codex && !settings.show_antigravity {
+    if !settings.show_claude_code && !settings.show_codex {
         settings.show_claude_code = true;
     }
     settings
@@ -391,7 +284,6 @@ fn save_state_settings() {
     if let Some(s) = state.as_ref() {
         save_settings(&SettingsFile {
             tray_offset: s.tray_offset,
-            taskbar_index: s.taskbar_index,
             poll_interval_ms: s.poll_interval_ms,
             language: s
                 .language_override
@@ -400,7 +292,6 @@ fn save_state_settings() {
             widget_visible: s.widget_visible,
             show_claude_code: s.show_claude_code,
             show_codex: s.show_codex,
-            show_antigravity: s.show_antigravity,
         });
     }
 }
@@ -434,18 +325,6 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     ),
                 });
             }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: Some(s.antigravity_session_percent),
-                    tooltip: format!(
-                        "{} 5h: {} | 7d: {}",
-                        s.language.strings().antigravity_model,
-                        s.antigravity_session_text,
-                        s.antigravity_weekly_text
-                    ),
-                });
-            }
             icons
         }
         Some(s) => {
@@ -462,13 +341,6 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
                     kind: tray_icon::TrayIconKind::Codex,
                     percent: None,
                     tooltip: s.language.strings().codex_window_title.to_string(),
-                });
-            }
-            if s.show_antigravity {
-                icons.push(tray_icon::TrayIconData {
-                    kind: tray_icon::TrayIconKind::Antigravity,
-                    percent: None,
-                    tooltip: s.language.strings().antigravity_window_title.to_string(),
                 });
             }
             icons
@@ -502,103 +374,6 @@ fn toggle_widget_visibility(hwnd: HWND) {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
     }
-}
-
-fn attach_to_taskbar(hwnd: HWND, requested_index: usize) -> bool {
-    let taskbars = native_interop::find_taskbars();
-    if taskbars.is_empty() {
-        diagnose::log("taskbar not found; using fallback popup window");
-        return false;
-    }
-
-    let index = requested_index.min(taskbars.len().saturating_sub(1));
-    let taskbar = taskbars[index];
-    diagnose::log(format!(
-        "taskbar selected index={index} count={} hwnd={:?} rect=({}, {}, {}, {})",
-        taskbars.len(),
-        taskbar.hwnd,
-        taskbar.rect.left,
-        taskbar.rect.top,
-        taskbar.rect.right,
-        taskbar.rect.bottom
-    ));
-
-    let old_hook = {
-        let mut state = lock_state();
-        state.as_mut().and_then(|s| s.win_event_hook.take())
-    };
-    if let Some(hook) = old_hook {
-        native_interop::unhook_win_event(hook);
-    }
-
-    native_interop::embed_in_taskbar(hwnd, taskbar.hwnd);
-
-    let tray_notify = native_interop::find_child_window(taskbar.hwnd, "TrayNotifyWnd");
-    if tray_notify.is_some() {
-        diagnose::log("TrayNotifyWnd found");
-    } else {
-        diagnose::log("TrayNotifyWnd not found");
-    }
-
-    let hook = tray_notify.and_then(|tray_hwnd| {
-        let thread_id = native_interop::get_window_thread_id(tray_hwnd);
-        native_interop::set_tray_event_hook(thread_id, on_tray_location_changed)
-    });
-    if hook.is_some() {
-        diagnose::log("tray event hook installed");
-    } else {
-        diagnose::log("tray event hook could not be installed");
-    }
-
-    let mut state = lock_state();
-    if let Some(s) = state.as_mut() {
-        s.taskbar_hwnd = Some(taskbar.hwnd);
-        s.tray_notify_hwnd = tray_notify;
-        s.win_event_hook = hook;
-        s.taskbar_index = index;
-        s.embedded = true;
-    }
-    true
-}
-
-fn taskbar_at_point(pt: POINT) -> Option<(usize, native_interop::TaskbarWindow)> {
-    native_interop::find_taskbars()
-        .into_iter()
-        .enumerate()
-        .find(|(_, taskbar)| {
-            pt.x >= taskbar.rect.left
-                && pt.x < taskbar.rect.right
-                && pt.y >= taskbar.rect.top
-                && pt.y < taskbar.rect.bottom
-        })
-}
-
-fn tray_left_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT) -> i32 {
-    let mut tray_left = taskbar_rect.right;
-    if let Some(tray_hwnd) = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd") {
-        if let Some(tray_rect) = native_interop::get_window_rect_safe(tray_hwnd) {
-            tray_left = tray_rect.left;
-        }
-    }
-    tray_left
-}
-
-fn clamp_offset_for_taskbar(taskbar_hwnd: HWND, taskbar_rect: RECT, offset: i32) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let max_offset = (tray_left - taskbar_rect.left - total_widget_width()).max(0);
-    offset.clamp(0, max_offset)
-}
-
-fn offset_for_drop_point(
-    taskbar_hwnd: HWND,
-    taskbar_rect: RECT,
-    pt: POINT,
-    drag_start_client_x: i32,
-) -> i32 {
-    let tray_left = tray_left_for_taskbar(taskbar_hwnd, taskbar_rect);
-    let desired_left = pt.x - taskbar_rect.left - drag_start_client_x;
-    let offset = tray_left - taskbar_rect.left - total_widget_width() - desired_left;
-    clamp_offset_for_taskbar(taskbar_hwnd, taskbar_rect, offset)
 }
 
 fn now_unix_secs() -> u64 {
@@ -668,19 +443,6 @@ fn refresh_usage_texts(state: &mut AppState) {
     } else if state.show_codex {
         state.codex_session_text = "!".to_string();
         state.codex_weekly_text = "!".to_string();
-    }
-
-    if let Some(antigravity) = data.antigravity.as_ref() {
-        state.antigravity_session_text = poller::format_line(&antigravity.session, strings);
-        state.antigravity_weekly_text =
-            if antigravity.weekly.resets_at.is_none() && antigravity.weekly.percentage == 0.0 {
-                "--".to_string()
-            } else {
-                poller::format_line(&antigravity.weekly, strings)
-            };
-    } else if state.show_antigravity {
-        state.antigravity_session_text = "!".to_string();
-        state.antigravity_weekly_text = "!".to_string();
     }
 }
 
@@ -1031,38 +793,19 @@ const LABEL_WIDTH: i32 = 18;
 const LABEL_RIGHT_MARGIN: i32 = 10;
 const BAR_RIGHT_MARGIN: i32 = 4;
 const TEXT_WIDTH: i32 = 62;
-const MODEL_RIGHT_MARGIN: i32 = 3;
+const MODEL_RIGHT_MARGIN: i32 = 5;
 const RIGHT_MARGIN: i32 = 1;
 const WIDGET_HEIGHT: i32 = 46;
 
-fn is_drag_handle_point(client_x: i32, client_y: i32) -> bool {
-    let divider_h = sc(25);
-    let divider_top = (sc(WIDGET_HEIGHT) - divider_h) / 2;
-    client_x >= 0
-        && client_x < sc(LEFT_DIVIDER_W)
-        && client_y >= divider_top
-        && client_y < divider_top + divider_h
-}
-
-fn cursor_is_on_drag_handle(hwnd: HWND) -> bool {
-    unsafe {
-        let mut pt = POINT::default();
-        if GetCursorPos(&mut pt).is_err() || !ScreenToClient(hwnd, &mut pt).as_bool() {
-            return false;
-        }
-        is_drag_handle_point(pt.x, pt.y)
-    }
-}
-
-fn active_model_count(show_claude_code: bool, show_codex: bool, show_antigravity: bool) -> i32 {
-    (show_claude_code as i32 + show_codex as i32 + show_antigravity as i32).max(1)
+fn active_model_count(show_claude_code: bool, show_codex: bool) -> i32 {
+    (show_claude_code as i32 + show_codex as i32).max(1)
 }
 
 fn row_bar_segment_count(active_models: i32) -> i32 {
-    match active_models {
-        1 => SEGMENT_COUNT,
-        2 => 5,
-        _ => 4,
+    if active_models > 1 {
+        5
+    } else {
+        SEGMENT_COUNT
     }
 }
 
@@ -1082,11 +825,7 @@ fn total_widget_width_for(active_models: i32) -> i32 {
 }
 
 fn total_widget_width_for_state(state: &AppState) -> i32 {
-    total_widget_width_for(active_model_count(
-        state.show_claude_code,
-        state.show_codex,
-        state.show_antigravity,
-    ))
+    total_widget_width_for(active_model_count(state.show_claude_code, state.show_codex))
 }
 
 fn total_widget_width() -> i32 {
@@ -1094,7 +833,7 @@ fn total_widget_width() -> i32 {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| active_model_count(s.show_claude_code, s.show_codex, s.show_antigravity))
+            .map(|s| active_model_count(s.show_claude_code, s.show_codex))
             .unwrap_or(1)
     };
     total_widget_width_for(active_models)
@@ -1110,10 +849,6 @@ fn codex_accent_color(is_dark: bool) -> Color {
     } else {
         Color::from_hex("#1F1F1F")
     }
-}
-
-fn antigravity_accent_color() -> Color {
-    Color::from_hex("#4285F4")
 }
 
 fn claude_usage_text_color(is_dark: bool) -> Color {
@@ -1132,14 +867,6 @@ fn codex_usage_text_color(is_dark: bool) -> Color {
     }
 }
 
-fn antigravity_usage_text_color(is_dark: bool) -> Color {
-    if is_dark {
-        Color::from_hex("#8AB4F8")
-    } else {
-        Color::from_hex("#1967D2")
-    }
-}
-
 pub fn run() {
     // Enable Per-Monitor DPI Awareness V2 for crisp rendering at any scale factor
     unsafe {
@@ -1148,29 +875,15 @@ pub fn run() {
     }
     diagnose::log("window::run started");
 
-    // Single-instance guard: silently exit if another instance is running.
-    // Exception: when relaunched after an explorer restart (ENV_RELAUNCH set),
-    // wait for the previous instance to release the mutex, then take over.
-    let is_relaunch = std::env::var(ENV_RELAUNCH).is_ok();
+    // Single-instance guard: silently exit if another instance is running
     let mutex_name = native_interop::wide_str("Global\\ClaudeCodeUsageMonitor");
     let _mutex = unsafe {
-        let handle = CreateMutexW(None, true, PCWSTR::from_raw(mutex_name.as_ptr()));
+        let handle = CreateMutexW(None, false, PCWSTR::from_raw(mutex_name.as_ptr()));
         match handle {
             Ok(h) => {
                 if GetLastError() == ERROR_ALREADY_EXISTS {
-                    if is_relaunch {
-                        diagnose::log("relaunch: waiting for previous instance to exit");
-                        let wait_result = WaitForSingleObject(h, 10_000);
-                        if wait_result != WAIT_OBJECT_0 && wait_result != WAIT_ABANDONED {
-                            diagnose::log(format!(
-                                "startup aborted: previous instance did not exit cleanly ({wait_result:?})"
-                            ));
-                            return;
-                        }
-                    } else {
-                        diagnose::log("startup aborted: another instance is already running");
-                        return;
-                    }
+                    diagnose::log("startup aborted: another instance is already running");
+                    return;
                 }
                 h
             }
@@ -1214,11 +927,8 @@ pub fn run() {
 
         // Create as layered popup (will be reparented into taskbar)
         let title = native_interop::wide_str(language.strings().window_title);
-        let initial_model_count = active_model_count(
-            settings.show_claude_code,
-            settings.show_codex,
-            settings.show_antigravity,
-        );
+        let initial_model_count =
+            active_model_count(settings.show_claude_code, settings.show_codex);
         let hwnd = CreateWindowExW(
             WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_NOACTIVATE,
             PCWSTR::from_raw(class_name.as_ptr()),
@@ -1276,13 +986,8 @@ pub fn run() {
                 codex_session_text: "--".to_string(),
                 codex_weekly_percent: 0.0,
                 codex_weekly_text: "--".to_string(),
-                antigravity_session_percent: 0.0,
-                antigravity_session_text: "--".to_string(),
-                antigravity_weekly_percent: 0.0,
-                antigravity_weekly_text: "--".to_string(),
                 show_claude_code: settings.show_claude_code,
                 show_codex: settings.show_codex,
-                show_antigravity: settings.show_antigravity,
                 data: None,
                 poll_interval_ms: settings.poll_interval_ms,
                 retry_count: 0,
@@ -1293,19 +998,45 @@ pub fn run() {
                 last_poll_ok: false,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
-                taskbar_index: settings.taskbar_index,
                 tray_offset: settings.tray_offset,
                 dragging: false,
                 drag_start_mouse_x: 0,
-                drag_start_client_x: 0,
                 drag_start_offset: 0,
                 widget_visible: settings.widget_visible,
             });
         }
 
         // Try to embed in taskbar
-        if attach_to_taskbar(hwnd, settings.taskbar_index) {
+        if let Some(taskbar_hwnd) = native_interop::find_taskbar() {
+            diagnose::log(format!("taskbar found hwnd={:?}", taskbar_hwnd));
+            native_interop::embed_in_taskbar(hwnd, taskbar_hwnd);
             embedded = true;
+
+            let mut state = lock_state();
+            let s = state.as_mut().unwrap();
+            s.taskbar_hwnd = Some(taskbar_hwnd);
+            s.embedded = true;
+
+            let tray_notify = native_interop::find_child_window(taskbar_hwnd, "TrayNotifyWnd");
+            s.tray_notify_hwnd = tray_notify;
+            if tray_notify.is_some() {
+                diagnose::log("TrayNotifyWnd found");
+            } else {
+                diagnose::log("TrayNotifyWnd not found");
+            }
+
+            if let Some(tray_hwnd) = tray_notify {
+                let thread_id = native_interop::get_window_thread_id(tray_hwnd);
+                let hook = native_interop::set_tray_event_hook(thread_id, on_tray_location_changed);
+                s.win_event_hook = hook;
+                if hook.is_some() {
+                    diagnose::log("tray event hook installed");
+                } else {
+                    diagnose::log("tray event hook could not be installed");
+                }
+            }
+        } else {
+            diagnose::log("taskbar not found; using fallback popup window");
         }
 
         // If not embedded, fall back to topmost popup with SetLayeredWindowAttributes
@@ -1344,13 +1075,6 @@ pub fn run() {
                 .unwrap_or(POLL_15_MIN)
         };
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
-
-        // Watch for explorer.exe restarts so we can re-embed and re-add the tray
-        // icon (the shell discards tray registrations when it restarts). This
-        // runs on a dedicated thread, NOT a window timer: once explorer destroys
-        // the taskbar, our embedded child window stops receiving all messages
-        // (WM_TIMER included), so a timer would never fire again.
-        spawn_taskbar_watchdog();
 
         // Initial poll
         let send_hwnd = SendHwnd::from_hwnd(hwnd);
@@ -1401,13 +1125,8 @@ fn render_layered() {
         codex_session_text,
         codex_weekly_pct,
         codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
         show_claude_code,
         show_codex,
-        show_antigravity,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -1424,13 +1143,8 @@ fn render_layered() {
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
-                s.show_antigravity,
             ),
             None => return,
         }
@@ -1451,7 +1165,6 @@ fn render_layered() {
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -1519,15 +1232,9 @@ fn render_layered() {
             &codex_session_text,
             codex_weekly_pct,
             &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
             show_claude_code,
             show_codex,
-            show_antigravity,
             &codex_accent,
-            &antigravity_accent,
         );
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
@@ -1595,15 +1302,9 @@ fn paint_content(
     codex_session_text: &str,
     codex_weekly_pct: f64,
     codex_weekly_text: &str,
-    antigravity_session_pct: f64,
-    antigravity_session_text: &str,
-    antigravity_weekly_pct: f64,
-    antigravity_weekly_text: &str,
     show_claude_code: bool,
     show_codex: bool,
-    show_antigravity: bool,
     codex_accent: &Color,
-    antigravity_accent: &Color,
 ) {
     unsafe {
         let client_rect = RECT {
@@ -1691,14 +1392,10 @@ fn paint_content(
             session_text,
             codex_session_pct,
             codex_session_text,
-            antigravity_session_pct,
-            antigravity_session_text,
             show_claude_code,
             show_codex,
-            show_antigravity,
             accent,
             codex_accent,
-            antigravity_accent,
             track,
         );
         draw_row(
@@ -1712,14 +1409,10 @@ fn paint_content(
             weekly_text,
             codex_weekly_pct,
             codex_weekly_text,
-            antigravity_weekly_pct,
-            antigravity_weekly_text,
             show_claude_code,
             show_codex,
-            show_antigravity,
             accent,
             codex_accent,
-            antigravity_accent,
             track,
         );
 
@@ -1730,15 +1423,15 @@ fn paint_content(
 
 fn do_poll(send_hwnd: SendHwnd) {
     let hwnd = send_hwnd.to_hwnd();
-    let (show_claude_code, show_codex, show_antigravity) = {
+    let (show_claude_code, show_codex) = {
         let state = lock_state();
         state
             .as_ref()
-            .map(|s| (s.show_claude_code, s.show_codex, s.show_antigravity))
-            .unwrap_or((true, false, false))
+            .map(|s| (s.show_claude_code, s.show_codex))
+            .unwrap_or((true, false))
     };
 
-    match poller::poll(show_claude_code, show_codex, show_antigravity) {
+    match poller::poll(show_claude_code, show_codex) {
         Ok(data) => {
             let mut state = lock_state();
             if let Some(s) = state.as_mut() {
@@ -1755,13 +1448,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                 } else if s.show_codex {
                     s.codex_session_percent = 0.0;
                     s.codex_weekly_percent = 0.0;
-                }
-                if let Some(antigravity) = data.antigravity.as_ref() {
-                    s.antigravity_session_percent = antigravity.session.percentage;
-                    s.antigravity_weekly_percent = antigravity.weekly.percentage;
-                } else if s.show_antigravity {
-                    s.antigravity_session_percent = 0.0;
-                    s.antigravity_weekly_percent = 0.0;
                 }
                 // Stop fast-poll if reset data is now fresh
                 if !poller::app_is_past_reset(&data) {
@@ -1794,14 +1480,6 @@ fn do_poll(send_hwnd: SendHwnd) {
         }
         Err(e) => {
             let auth_watch = match e {
-                poller::PollError::AuthRequired | poller::PollError::TokenExpired
-                    if show_antigravity && !show_claude_code && !show_codex =>
-                {
-                    Some((
-                        poller::CredentialWatchMode::Antigravity,
-                        poller::credential_watch_snapshot(poller::CredentialWatchMode::Antigravity),
-                    ))
-                }
                 poller::PollError::AuthRequired | poller::PollError::TokenExpired => Some((
                     poller::CredentialWatchMode::ActiveSource,
                     poller::credential_watch_snapshot(poller::CredentialWatchMode::ActiveSource),
@@ -1832,8 +1510,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.weekly_text = "!".to_string();
                             s.codex_session_text = "!".to_string();
                             s.codex_weekly_text = "!".to_string();
-                            s.antigravity_session_text = "!".to_string();
-                            s.antigravity_weekly_text = "!".to_string();
                             s.retry_count = s.retry_count.saturating_add(1);
                             unsafe {
                                 let _ = KillTimer(hwnd, TIMER_POLL);
@@ -1852,8 +1528,6 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
                             s.retry_count = s.retry_count.saturating_add(1);
                             let backoff = RETRY_BASE_MS.saturating_mul(
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
@@ -1880,19 +1554,12 @@ fn do_poll(send_hwnd: SendHwnd) {
                                 s.language.strings().token_expired_title,
                                 s.language.strings().token_expired_body,
                             )
-                        } else if s.show_codex {
+                        } else {
                             (
                                 s.language.strings(),
                                 tray_icon::TrayIconKind::Codex,
                                 s.language.strings().codex_token_expired_title,
                                 s.language.strings().codex_token_expired_body,
-                            )
-                        } else {
-                            (
-                                s.language.strings(),
-                                tray_icon::TrayIconKind::Antigravity,
-                                s.language.strings().antigravity_token_expired_title,
-                                s.language.strings().antigravity_token_expired_body,
                             )
                         }
                     })
@@ -1948,12 +1615,6 @@ fn schedule_countdown_timer() {
             .as_ref()
             .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
         data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.antigravity
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.antigravity
             .as_ref()
             .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
     ];
@@ -2080,24 +1741,6 @@ fn position_at_taskbar() {
     }
 
     let widget_width = total_widget_width();
-    let max_offset = (tray_left - taskbar_rect.left - widget_width).max(0);
-    let tray_offset = tray_offset.clamp(0, max_offset);
-    let offset_changed = {
-        let mut state = lock_state();
-        if let Some(s) = state.as_mut() {
-            if s.tray_offset != tray_offset {
-                s.tray_offset = tray_offset;
-                true
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    };
-    if offset_changed {
-        save_state_settings();
-    }
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
@@ -2301,35 +1944,39 @@ unsafe extern "system" fn wnd_proc(
                 let state = lock_state();
                 state.as_ref().map(|s| s.dragging).unwrap_or(false)
             };
+            // Always show resize cursor while dragging or when hovering divider zone
+            let hit_test = (lparam.0 & 0xFFFF) as u16;
             if is_dragging {
                 let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
                 SetCursor(cursor);
                 return LRESULT(1);
             }
-            if cursor_is_on_drag_handle(hwnd) {
-                let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
-                SetCursor(cursor);
-                return LRESULT(1);
+            if hit_test == 1 {
+                // HTCLIENT
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let _ = ScreenToClient(hwnd, &mut pt);
+                if pt.x < sc(DIVIDER_HIT_ZONE) {
+                    let cursor = LoadCursorW(HINSTANCE::default(), IDC_SIZEWE).unwrap_or_default();
+                    SetCursor(cursor);
+                    return LRESULT(1);
+                }
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONDOWN => {
             let client_x = (lparam.0 & 0xFFFF) as i16 as i32;
-            let client_y = ((lparam.0 >> 16) & 0xFFFF) as i16 as i32;
-            if !is_drag_handle_point(client_x, client_y) {
-                return LRESULT(0);
+            if client_x < sc(DIVIDER_HIT_ZONE) {
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                let mut state = lock_state();
+                if let Some(s) = state.as_mut() {
+                    s.dragging = true;
+                    s.drag_start_mouse_x = pt.x;
+                    s.drag_start_offset = s.tray_offset;
+                }
+                SetCapture(hwnd);
             }
-
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let mut state = lock_state();
-            if let Some(s) = state.as_mut() {
-                s.dragging = true;
-                s.drag_start_mouse_x = pt.x;
-                s.drag_start_client_x = client_x;
-                s.drag_start_offset = s.tray_offset;
-            }
-            SetCapture(hwnd);
             LRESULT(0)
         }
         WM_MOUSEMOVE => {
@@ -2429,14 +2076,13 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_LBUTTONUP => {
-            let mut pt = POINT::default();
-            let _ = GetCursorPos(&mut pt);
-            let drag_result = {
+            let was_dragging = {
                 let mut state = lock_state();
                 if let Some(s) = state.as_mut() {
                     if s.dragging {
                         s.dragging = false;
-                        Some((s.taskbar_index, s.drag_start_client_x))
+                        let offset = s.tray_offset;
+                        Some(offset)
                     } else {
                         None
                     }
@@ -2444,28 +2090,8 @@ unsafe extern "system" fn wnd_proc(
                     None
                 }
             };
-            if let Some((current_taskbar_index, drag_start_client_x)) = drag_result {
+            if was_dragging.is_some() {
                 let _ = ReleaseCapture();
-                if let Some((target_index, target_taskbar)) = taskbar_at_point(pt) {
-                    if target_index != current_taskbar_index {
-                        let new_offset = offset_for_drop_point(
-                            target_taskbar.hwnd,
-                            target_taskbar.rect,
-                            pt,
-                            drag_start_client_x,
-                        );
-                        {
-                            let mut state = lock_state();
-                            if let Some(s) = state.as_mut() {
-                                s.tray_offset = new_offset;
-                            }
-                        }
-                        if attach_to_taskbar(hwnd, target_index) {
-                            position_at_taskbar();
-                            render_layered();
-                        }
-                    }
-                }
                 save_state_settings();
             }
             LRESULT(0)
@@ -2553,24 +2179,19 @@ unsafe extern "system" fn wnd_proc(
                     // Reset the poll timer with the new interval
                     SetTimer(hwnd, TIMER_POLL, new_interval, None);
                 }
-                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX | IDM_MODEL_ANTIGRAVITY => {
+                IDM_MODEL_CLAUDE_CODE | IDM_MODEL_CODEX => {
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
                             match id {
                                 IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || s.show_antigravity || !s.show_claude_code {
+                                    if s.show_codex || !s.show_claude_code {
                                         s.show_claude_code = !s.show_claude_code;
                                     }
                                 }
                                 IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || s.show_antigravity || !s.show_codex {
+                                    if s.show_claude_code || !s.show_codex {
                                         s.show_codex = !s.show_codex;
-                                    }
-                                }
-                                IDM_MODEL_ANTIGRAVITY => {
-                                    if s.show_claude_code || s.show_codex || !s.show_antigravity {
-                                        s.show_antigravity = !s.show_antigravity;
                                     }
                                 }
                                 _ => {}
@@ -2579,8 +2200,6 @@ unsafe extern "system" fn wnd_proc(
                             s.weekly_text = "...".to_string();
                             s.codex_session_text = "...".to_string();
                             s.codex_weekly_text = "...".to_string();
-                            s.antigravity_session_text = "...".to_string();
-                            s.antigravity_weekly_text = "...".to_string();
                         }
                     }
                     save_state_settings();
@@ -2671,7 +2290,6 @@ fn show_context_menu(hwnd: HWND) {
             widget_visible,
             show_claude_code,
             show_codex,
-            show_antigravity,
         ) = {
             let state = lock_state();
             match state.as_ref() {
@@ -2683,7 +2301,6 @@ fn show_context_menu(hwnd: HWND) {
                     s.widget_visible,
                     s.show_claude_code,
                     s.show_codex,
-                    s.show_antigravity,
                 ),
                 None => (
                     POLL_15_MIN,
@@ -2692,7 +2309,6 @@ fn show_context_menu(hwnd: HWND) {
                     UpdateStatus::Idle,
                     true,
                     true,
-                    false,
                     false,
                 ),
             }
@@ -2765,19 +2381,6 @@ fn show_context_menu(hwnd: HWND) {
             codex_flags,
             IDM_MODEL_CODEX as usize,
             PCWSTR::from_raw(codex_model.as_ptr()),
-        );
-
-        let antigravity_model = native_interop::wide_str(strings.antigravity_model);
-        let antigravity_flags = if show_antigravity {
-            MF_CHECKED
-        } else {
-            MENU_ITEM_FLAGS(0)
-        };
-        let _ = AppendMenuW(
-            models_menu,
-            antigravity_flags,
-            IDM_MODEL_ANTIGRAVITY as usize,
-            PCWSTR::from_raw(antigravity_model.as_ptr()),
         );
 
         let models_label = native_interop::wide_str(strings.models);
@@ -2932,13 +2535,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
         codex_session_text,
         codex_weekly_pct,
         codex_weekly_text,
-        antigravity_session_pct,
-        antigravity_session_text,
-        antigravity_weekly_pct,
-        antigravity_weekly_text,
         show_claude_code,
         show_codex,
-        show_antigravity,
     ) = {
         let state = lock_state();
         match state.as_ref() {
@@ -2953,13 +2551,8 @@ fn paint(hdc: HDC, hwnd: HWND) {
                 s.codex_session_text.clone(),
                 s.codex_weekly_percent,
                 s.codex_weekly_text.clone(),
-                s.antigravity_session_percent,
-                s.antigravity_session_text.clone(),
-                s.antigravity_weekly_percent,
-                s.antigravity_weekly_text.clone(),
                 s.show_claude_code,
                 s.show_codex,
-                s.show_antigravity,
             ),
             None => return,
         }
@@ -2967,7 +2560,6 @@ fn paint(hdc: HDC, hwnd: HWND) {
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
-    let antigravity_accent = antigravity_accent_color();
     let track = if is_dark {
         Color::from_hex("#444444")
     } else {
@@ -3016,15 +2608,9 @@ fn paint(hdc: HDC, hwnd: HWND) {
             &codex_session_text,
             codex_weekly_pct,
             &codex_weekly_text,
-            antigravity_session_pct,
-            &antigravity_session_text,
-            antigravity_weekly_pct,
-            &antigravity_weekly_text,
             show_claude_code,
             show_codex,
-            show_antigravity,
             &codex_accent,
-            &antigravity_accent,
         );
 
         let _ = BitBlt(hdc, 0, 0, width, height, mem_dc, 0, 0, SRCCOPY);
@@ -3046,20 +2632,16 @@ fn draw_row(
     claude_text: &str,
     codex_percent: f64,
     codex_text: &str,
-    antigravity_percent: f64,
-    antigravity_text: &str,
     show_claude_code: bool,
     show_codex: bool,
-    show_antigravity: bool,
     claude_accent: &Color,
     codex_accent: &Color,
-    antigravity_accent: &Color,
     track: &Color,
 ) {
     let seg_h = sc(SEGMENT_H);
-    let active_models = active_model_count(show_claude_code, show_codex, show_antigravity);
+    let active_models = active_model_count(show_claude_code, show_codex);
     let segment_count = row_bar_segment_count(active_models);
-    let use_model_text_colors = active_models > 1;
+    let use_model_text_colors = show_claude_code && show_codex;
     let claude_value_color = if use_model_text_colors {
         claude_usage_text_color(is_dark)
     } else {
@@ -3067,11 +2649,6 @@ fn draw_row(
     };
     let codex_value_color = if use_model_text_colors {
         codex_usage_text_color(is_dark)
-    } else {
-        *text_color
-    };
-    let antigravity_value_color = if use_model_text_colors {
-        antigravity_usage_text_color(is_dark)
     } else {
         *text_color
     };
@@ -3118,20 +2695,6 @@ fn draw_row(
                 codex_accent,
                 track,
                 &codex_value_color,
-            );
-            model_x += model_usage_width(segment_count) + sc(MODEL_RIGHT_MARGIN);
-        }
-        if show_antigravity {
-            draw_usage_bar(
-                hdc,
-                model_x,
-                y,
-                segment_count,
-                antigravity_percent,
-                antigravity_text,
-                antigravity_accent,
-                track,
-                &antigravity_value_color,
             );
         }
     }

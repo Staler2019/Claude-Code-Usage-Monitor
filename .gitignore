@@ -22,7 +22,6 @@ Desktop.ini
 
 # Local release workflow helper
 workflow.cmd
-AGENTS.md
 
 # Local WinGet manifest generation output
 /manifests/
