@@ -498,24 +498,21 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
 
 fn fetch_usage_with_fallback(token: &str) -> Result<UsageData, PollError> {
     // Try the dedicated usage endpoint first
-    match try_usage_endpoint(token)? {
-        Some(data) => {
-            // If reset timers are missing, fill them in from the Messages API
-            if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
-                if let Ok(fallback) = fetch_usage_via_messages(token) {
-                    let mut merged = data;
-                    if merged.session.resets_at.is_none() {
-                        merged.session.resets_at = fallback.session.resets_at;
-                    }
-                    if merged.weekly.resets_at.is_none() {
-                        merged.weekly.resets_at = fallback.weekly.resets_at;
-                    }
-                    return Ok(merged);
+    if let Some(data) = try_usage_endpoint(token)? {
+        // If reset timers are missing, fill them in from the Messages API
+        if data.session.resets_at.is_none() || data.weekly.resets_at.is_none() {
+            if let Ok(fallback) = fetch_usage_via_messages(token) {
+                let mut merged = data;
+                if merged.session.resets_at.is_none() {
+                    merged.session.resets_at = fallback.session.resets_at;
                 }
+                if merged.weekly.resets_at.is_none() {
+                    merged.weekly.resets_at = fallback.weekly.resets_at;
+                }
+                return Ok(merged);
             }
-            return Ok(data);
         }
-        None => {}
+        return Ok(data);
     }
 
     // Fall back to Messages API with rate limit headers
@@ -738,10 +735,10 @@ fn unix_to_system_time(unix_secs: Option<i64>) -> Option<SystemTime> {
 /// cannot be recovered from a subsequent heap or process memory dump.
 /// `write_volatile` prevents the compiler from treating this as dead-store and
 /// optimising it away.
-fn zero_string(s: &mut String) {
-    // SAFETY: We hold `&mut String` so there is no aliasing. The bytes remain
+fn zero_string(s: &mut str) {
+    // SAFETY: We hold `&mut str` so there is no aliasing. The bytes remain
     // allocated and valid until after this function returns and String::drop
-    // calls the allocator.
+    // calls the allocator. Zero bytes are valid UTF-8.
     let bytes = unsafe { s.as_bytes_mut() };
     for b in bytes.iter_mut() {
         unsafe { std::ptr::write_volatile(b as *mut u8, 0u8) };
@@ -1003,7 +1000,7 @@ fn decode_wsl_text(bytes: &[u8]) -> String {
 }
 
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
-    if bytes.len() < 2 || bytes.len() % 2 != 0 {
+    if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
     }
 
@@ -1122,7 +1119,7 @@ fn parse_datetime_to_unix(s: &str, _fmt: &str) -> Result<u64, ()> {
 }
 
 fn is_leap(y: u64) -> bool {
-    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+    (y.is_multiple_of(4) && !y.is_multiple_of(100)) || y.is_multiple_of(400)
 }
 
 /// Format a usage section as "X% · Yh" style text

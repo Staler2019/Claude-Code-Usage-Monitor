@@ -1,6 +1,22 @@
 use winres::{VersionInfo, WindowsResource};
 
 fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/icons/icon.ico");
+
+    // Build scripts run on the host. `winres` needs a Windows resource compiler,
+    // which is only available on Windows hosts. Skipping it elsewhere lets
+    // `cargo check --target x86_64-pc-windows-msvc` (and clippy) run from Linux/macOS
+    // CI without a Windows machine. Release binaries are always built on Windows
+    // (see .github/workflows/release.yml), so shipped executables keep their icon
+    // and version metadata.
+    if !cfg!(windows) {
+        println!(
+            "cargo:warning=winres skipped on a non-Windows host; no icon/version resource embedded"
+        );
+        return;
+    }
+
     let version = env!("CARGO_PKG_VERSION");
 
     // Embed the icon and richer PE version metadata into the executable.

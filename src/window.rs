@@ -260,8 +260,7 @@ fn load_settings() -> SettingsFile {
     // (polling too fast) or missed updates (polling never).
     settings.poll_interval_ms = settings
         .poll_interval_ms
-        .max(MIN_POLL_INTERVAL_MS)
-        .min(MAX_POLL_INTERVAL_MS);
+        .clamp(MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS);
 
     if !settings.show_claude_code && !settings.show_codex {
         settings.show_claude_code = true;
@@ -1284,6 +1283,7 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+#[allow(clippy::too_many_arguments)]
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -2621,6 +2621,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -2706,6 +2707,7 @@ fn model_usage_width(segment_count: i32) -> i32 {
         + sc(TEXT_WIDTH)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
