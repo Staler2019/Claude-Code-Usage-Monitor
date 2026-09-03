@@ -4,11 +4,28 @@ on:
   pull_request:
     branches:
       - main
+  push:
+    # release.yml already produces a `build` check for pushes to main.
+    branches-ignore:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # Required status check (see branch-protection.yml) - keep the job name `build`.
+  # Runs the full unit-test suite on Windows, including the GDI/USER handle-count
+  # regression tests that guard against the kernel-object leaks that can drive
+  # Windows into PAGE_FAULT_IN_NONPAGED_AREA.
   build:
     name: build
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -29,4 +46,61 @@ jobs:
         run: cargo build --release
 
       - name: Test
-        run: cargo test --release
+        run: cargo test --release -- --nocapture
+
+  # Formatting and lints. `clippy::zombie_processes` catches child processes that
+  # are killed or dropped without being waited on (handle leaks).
+  lint:
+    name: lint
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-lint-
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings -D clippy::zombie_processes
+
+  # Fast type-check of the Windows target from Linux (no linker needed).
+  # build.rs skips winres on non-Windows hosts to make this possible.
+  check-windows-target:
+    name: check-windows-target
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-check-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-check-
+
+      - name: Check (incl. tests) for x86_64-pc-windows-msvc
+        run: cargo check --all-targets --target x86_64-pc-windows-msvc

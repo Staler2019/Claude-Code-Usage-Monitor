@@ -510,7 +510,10 @@ mod tests {
 
     #[test]
     fn parse_checksum_accepts_bare_hex() {
-        assert_eq!(parse_checksum(KNOWN_SHA256_OF_ABC).unwrap(), KNOWN_SHA256_OF_ABC);
+        assert_eq!(
+            parse_checksum(KNOWN_SHA256_OF_ABC).unwrap(),
+            KNOWN_SHA256_OF_ABC
+        );
     }
 
     #[test]

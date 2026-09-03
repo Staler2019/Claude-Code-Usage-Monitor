@@ -7,9 +7,11 @@ use serde::{Deserialize, Serialize};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Gdi::*;
-use windows::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::*;
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{
+    CreateMutexW, GetCurrentProcess, GetGuiResources, GR_GDIOBJECTS, GR_USEROBJECTS,
+};
 use windows::Win32::UI::Accessibility::HWINEVENTHOOK;
 use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
@@ -23,6 +25,7 @@ use crate::native_interop::{
     self, Color, TIMER_COUNTDOWN, TIMER_POLL, TIMER_RESET_POLL, TIMER_UPDATE_CHECK, WM_APP_TRAY,
     WM_APP_USAGE_UPDATED,
 };
+use crate::poll_schedule::{self, PollGate, PollReason};
 use crate::poller;
 use crate::theme;
 use crate::tray_icon;
@@ -74,6 +77,14 @@ struct AppState {
     auth_watch_mode: poller::CredentialWatchMode,
     auth_watch_snapshot: poller::CredentialWatchSnapshot,
     last_poll_ok: bool,
+    /// True while TIMER_RESET_POLL is armed (fast "did the usage window reset?" polling).
+    reset_poll_active: bool,
+    /// Fast reset polls made since the reset was first observed; bounded by
+    /// `poll_schedule::RESET_POLL_MAX_ATTEMPTS` and reset when fresh data arrives.
+    reset_poll_attempts: u32,
+    /// TIMER_POLL interval requested by a poll worker; applied on the UI thread
+    /// (SetTimer must be called from the thread that owns the window).
+    pending_poll_timer_ms: Option<u32>,
     update_status: UpdateStatus,
     last_update_check_unix: Option<u64>,
 
@@ -134,6 +145,19 @@ static SUPPRESS_TRAY_REPOSITION_UNTIL: Mutex<Option<Instant>> = Mutex::new(None)
 /// Current system DPI (96 = 100% scaling, 144 = 150%, 192 = 200%, etc.)
 static CURRENT_DPI: AtomicU32 = AtomicU32::new(96);
 
+/// Admits at most one usage poll at a time. Every poll spawn goes through
+/// `spawn_poll`, so timer ticks can never stack worker threads (and the
+/// `wsl.exe` / TLS work they do) on top of each other.
+static POLL_GATE: PollGate = PollGate::new();
+static POLLS_STARTED: AtomicU32 = AtomicU32::new(0);
+static POLLS_SKIPPED: AtomicU32 = AtomicU32::new(0);
+
+/// Last `(x, y, w, h)` handed to `MoveWindow`. The tray-location WinEvent hook
+/// fires whenever anything in the tray moves, including as a consequence of our
+/// own `MoveWindow`; remembering the last placement lets us skip the move and
+/// the full layered re-render when nothing actually changed.
+static LAST_PLACEMENT: Mutex<Option<(i32, i32, i32, i32)>> = Mutex::new(None);
+
 /// Scale a base pixel value (designed at 96 DPI) to the current DPI.
 fn sc(px: i32) -> i32 {
     let dpi = CURRENT_DPI.load(Ordering::Relaxed);
@@ -157,17 +181,17 @@ fn refresh_dpi() {
 }
 
 fn load_embedded_app_icons() -> (HICON, HICON) {
-    unsafe {
-        let mut exe_buf = [0u16; 260];
-        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-        if len == 0 {
-            return (HICON::default(), HICON::default());
-        }
+    let Some(exe_path) = native_interop::current_module_path_wide() else {
+        return (HICON::default(), HICON::default());
+    };
 
+    unsafe {
         let mut large_icon = HICON::default();
         let mut small_icon = HICON::default();
+        // Both icons are kept for the lifetime of the process (window class icon
+        // and WM_SETICON), so nothing leaks here.
         let extracted = ExtractIconExW(
-            PCWSTR::from_raw(exe_buf.as_ptr()),
+            PCWSTR::from_raw(exe_path.as_ptr()),
             0,
             Some(&mut large_icon),
             Some(&mut small_icon),
@@ -260,8 +284,7 @@ fn load_settings() -> SettingsFile {
     // (polling too fast) or missed updates (polling never).
     settings.poll_interval_ms = settings
         .poll_interval_ms
-        .max(MIN_POLL_INTERVAL_MS)
-        .min(MAX_POLL_INTERVAL_MS);
+        .clamp(MIN_POLL_INTERVAL_MS, MAX_POLL_INTERVAL_MS);
 
     if !settings.show_claude_code && !settings.show_codex {
         settings.show_claude_code = true;
@@ -352,6 +375,114 @@ fn tray_icon_data_from_state() -> Vec<tray_icon::TrayIconData> {
 fn sync_tray_icons(hwnd: HWND) {
     let icons = tray_icon_data_from_state();
     tray_icon::sync(hwnd, &icons);
+    if diagnose::is_enabled() {
+        diagnose::log(format!("tray icons synced; {}", gui_resource_summary()));
+    }
+}
+
+/// Process-wide GDI and USER object counts, for `--diagnose` logs. These are
+/// the counters that climb when icons, bitmaps, fonts or windows leak; a healthy
+/// run keeps them flat across polls.
+fn gui_resource_summary() -> String {
+    unsafe {
+        let process = GetCurrentProcess();
+        let gdi = GetGuiResources(process, GR_GDIOBJECTS);
+        let user = GetGuiResources(process, GR_USEROBJECTS);
+        format!(
+            "gdi={gdi} user={user} polls_started={} polls_skipped={}",
+            POLLS_STARTED.load(Ordering::Relaxed),
+            POLLS_SKIPPED.load(Ordering::Relaxed)
+        )
+    }
+}
+
+/// Spawn a poll on a worker thread, unless one is already running.
+///
+/// Timer-driven requests that find the gate busy are dropped (the next tick
+/// tries again). User-driven requests are coalesced instead: the running poll
+/// performs one more pass when it finishes, so the UI never looks unresponsive
+/// and there are still never two polls in flight.
+fn spawn_poll(hwnd: HWND, reason: PollReason) {
+    let Some(guard) = POLL_GATE.try_acquire(reason.coalesces()) else {
+        POLLS_SKIPPED.fetch_add(1, Ordering::Relaxed);
+        diagnose::log(format!(
+            "poll skipped ({reason:?}): a poll is already in flight"
+        ));
+        return;
+    };
+
+    let send_hwnd = SendHwnd::from_hwnd(hwnd);
+    std::thread::spawn(move || {
+        poll_worker(send_hwnd, reason);
+        while guard.take_rerun_request() {
+            diagnose::log("running one coalesced follow-up poll");
+            poll_worker(send_hwnd, PollReason::UserRefresh);
+        }
+        drop(guard);
+    });
+}
+
+/// Body of a poll worker thread.
+///
+/// For interval polls while polling is paused on an auth error, first check
+/// whether the credential files changed and only poll if they did. That check
+/// runs `wsl.exe` and must happen here, on the worker, never on the UI thread
+/// that owns a child window of the taskbar.
+fn poll_worker(send_hwnd: SendHwnd, reason: PollReason) {
+    if reason == PollReason::Interval {
+        let auth_watch = {
+            let state = lock_state();
+            state.as_ref().map(|s| {
+                (
+                    s.auth_error_paused_polling,
+                    s.auth_watch_mode,
+                    s.auth_watch_snapshot.clone(),
+                )
+            })
+        };
+        if let Some((true, watch_mode, previous_snapshot)) = auth_watch {
+            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
+            if current_snapshot == previous_snapshot {
+                return;
+            }
+            let mut state = lock_state();
+            if let Some(s) = state.as_mut() {
+                if s.auth_error_paused_polling && s.auth_watch_mode == watch_mode {
+                    s.auth_watch_snapshot = current_snapshot;
+                }
+            }
+        }
+    }
+
+    POLLS_STARTED.fetch_add(1, Ordering::Relaxed);
+    if diagnose::is_enabled() {
+        diagnose::log(format!(
+            "poll started ({reason:?}); {}",
+            gui_resource_summary()
+        ));
+    }
+    do_poll(send_hwnd);
+}
+
+/// Apply a TIMER_POLL interval change requested by a poll worker. Must run on
+/// the UI thread: `SetTimer` requires the window to be owned by the caller.
+fn apply_pending_poll_timer(hwnd: HWND) {
+    let pending = {
+        let mut state = lock_state();
+        state.as_mut().and_then(|s| s.pending_poll_timer_ms.take())
+    };
+    if let Some(ms) = pending {
+        unsafe {
+            SetTimer(hwnd, TIMER_POLL, ms.max(1), None);
+        }
+    }
+}
+
+/// Forget the last applied widget placement so the next `position_at_taskbar`
+/// call always moves the window (used after display/DPI/settings changes).
+fn invalidate_placement_cache() {
+    let mut last = LAST_PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+    *last = None;
 }
 
 fn toggle_widget_visibility(hwnd: HWND) {
@@ -725,12 +856,9 @@ fn is_startup_enabled() -> bool {
             .to_string();
 
         // Get the current executable path
-        let mut exe_buf = [0u16; 260];
-        let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-        if len == 0 {
+        let Some(current_exe) = native_interop::current_module_path() else {
             return false;
-        }
-        let current_exe = String::from_utf16_lossy(&exe_buf[..len]);
+        };
 
         // Case-insensitive comparison (Windows paths are case-insensitive)
         reg_value.eq_ignore_ascii_case(&current_exe)
@@ -756,19 +884,18 @@ fn set_startup_enabled(enable: bool) {
         let key_name = native_interop::wide_str(STARTUP_REGISTRY_KEY);
 
         if enable {
-            let mut exe_buf = [0u16; 260];
-            let len = GetModuleFileNameW(None, &mut exe_buf) as usize;
-            if len > 0 {
-                // Write the wide string including null terminator
-                let byte_len = ((len + 1) * 2) as u32;
+            // `exe_path` already carries its terminating NUL, so the byte
+            // length below is exactly the buffer size: no over-read.
+            if let Some(exe_path) = native_interop::current_module_path_wide() {
+                let byte_len = exe_path.len() * std::mem::size_of::<u16>();
                 let _ = RegSetValueExW(
                     hkey,
                     PCWSTR::from_raw(key_name.as_ptr()),
                     0,
                     REG_SZ,
                     Some(std::slice::from_raw_parts(
-                        exe_buf.as_ptr() as *const u8,
-                        byte_len as usize,
+                        exe_path.as_ptr() as *const u8,
+                        byte_len,
                     )),
                 );
             }
@@ -996,6 +1123,9 @@ pub fn run() {
                 auth_watch_mode: poller::CredentialWatchMode::ActiveSource,
                 auth_watch_snapshot: Vec::new(),
                 last_poll_ok: false,
+                reset_poll_active: false,
+                reset_poll_attempts: 0,
+                pending_poll_timer_ms: None,
                 update_status: UpdateStatus::Idle,
                 last_update_check_unix: settings.last_update_check_unix,
                 tray_offset: settings.tray_offset,
@@ -1077,11 +1207,7 @@ pub fn run() {
         SetTimer(hwnd, TIMER_POLL, initial_poll_ms, None);
 
         // Initial poll
-        let send_hwnd = SendHwnd::from_hwnd(hwnd);
-        std::thread::spawn(move || {
-            diagnose::log("initial poll thread started");
-            do_poll(send_hwnd);
-        });
+        spawn_poll(hwnd, PollReason::Startup);
 
         schedule_auto_update_check(hwnd);
         let should_check_updates = {
@@ -1162,6 +1288,14 @@ fn render_layered() {
 
     let width = total_widget_width();
     let height = sc(WIDGET_HEIGHT);
+    // Never hand GDI a zero/negative bitmap or write past a DIB whose size
+    // overflowed; both are ways to corrupt kernel-mapped memory.
+    let Some(pixel_count) = poll_schedule::pixel_count(width, height) else {
+        diagnose::log(format!(
+            "render skipped: invalid widget size {width}x{height}"
+        ));
+        return;
+    };
 
     let accent = claude_accent_color();
     let codex_accent = codex_accent_color(is_dark);
@@ -1209,7 +1343,6 @@ fn render_layered() {
         }
 
         let old_bmp = SelectObject(mem_dc, dib);
-        let pixel_count = (width * height) as usize;
 
         // Render once with the actual taskbar background colour.
         // Using an opaque background lets us use CLEARTYPE_QUALITY for
@@ -1239,6 +1372,9 @@ fn render_layered() {
 
         // Background pixels → alpha 1 (nearly invisible but still hittable for right-click).
         // Content pixels → fully opaque (preserves ClearType sub-pixel rendering).
+        // GDI batches drawing calls; flush them before touching the DIB bits
+        // from the CPU.
+        let _ = GdiFlush();
         let bg_bgr = bg_color.to_colorref();
         let pixel_data = std::slice::from_raw_parts_mut(bits as *mut u32, pixel_count);
         for px in pixel_data.iter_mut() {
@@ -1284,6 +1420,7 @@ fn render_layered() {
 }
 
 /// Paint all widget content onto a DC with a given background color.
+#[allow(clippy::too_many_arguments)]
 fn paint_content(
     hdc: HDC,
     width: i32,
@@ -1449,24 +1586,18 @@ fn do_poll(send_hwnd: SendHwnd) {
                     s.codex_session_percent = 0.0;
                     s.codex_weekly_percent = 0.0;
                 }
-                // Stop fast-poll if reset data is now fresh
-                if !poller::app_is_past_reset(&data) {
-                    unsafe {
-                        let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                    }
-                }
-
+                // Fast reset polling is (re)evaluated on the UI thread in
+                // schedule_countdown_timer once WM_APP_USAGE_UPDATED lands;
+                // it stops as soon as the data is no longer past its reset.
                 s.data = Some(data);
                 s.last_poll_ok = true;
                 refresh_usage_texts(s);
 
                 // Recovered from errors — restore normal poll interval
+                // (applied on the UI thread by apply_pending_poll_timer).
                 if s.retry_count > 0 {
                     s.retry_count = 0;
-                    let interval = s.poll_interval_ms;
-                    unsafe {
-                        SetTimer(hwnd, TIMER_POLL, interval, None);
-                    }
+                    s.pending_poll_timer_ms = Some(s.poll_interval_ms);
                 }
                 s.force_notify_auth_error = false;
                 s.auth_error_paused_polling = false;
@@ -1511,12 +1642,10 @@ fn do_poll(send_hwnd: SendHwnd) {
                             s.codex_session_text = "!".to_string();
                             s.codex_weekly_text = "!".to_string();
                             s.retry_count = s.retry_count.saturating_add(1);
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_POLL);
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-                                SetTimer(hwnd, TIMER_POLL, s.poll_interval_ms, None);
-                            }
+                            // Restart the regular interval; countdown and fast
+                            // reset timers are stopped by schedule_countdown_timer
+                            // because last_poll_ok is now false.
+                            s.pending_poll_timer_ms = Some(s.poll_interval_ms);
                         }
                         _ => {
                             // Transient network / credential-missing errors: exponential backoff.
@@ -1533,10 +1662,7 @@ fn do_poll(send_hwnd: SendHwnd) {
                                 1u32.checked_shl(s.retry_count - 1).unwrap_or(u32::MAX),
                             );
                             let retry_ms = backoff.min(s.poll_interval_ms);
-                            unsafe {
-                                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
-                                SetTimer(hwnd, TIMER_POLL, retry_ms, None);
-                            }
+                            s.pending_poll_timer_ms = Some(retry_ms);
                         }
                     }
                 }
@@ -1576,57 +1702,104 @@ fn do_poll(send_hwnd: SendHwnd) {
     }
 }
 
+/// What to do with TIMER_RESET_POLL after a state change.
+enum ResetPollAction {
+    /// Arm (or re-arm) the fast reset poll with this interval.
+    Arm(u32),
+    /// Stop fast reset polling.
+    Stop,
+    /// Leave the timer as it is (already armed, or budget exhausted).
+    Leave,
+}
+
+/// Re-arm the countdown timer and (re)evaluate fast reset polling.
+///
+/// Runs on the UI thread after every poll and every countdown tick. The
+/// decision is computed under the state lock and the Win32 timer calls are
+/// made after the lock is released.
+///
+/// Fast reset polling is bounded: `poll_schedule::reset_poll_delay_ms` backs
+/// off from 5 s to 160 s and gives up after `RESET_POLL_MAX_ATTEMPTS`. Attempts
+/// are only reset once a poll returns data that is no longer past its reset,
+/// so a stale `resets_at` from the API cannot restart the burst on every
+/// regular poll. Previously this timer was re-armed at 5 s forever.
 fn schedule_countdown_timer() {
-    let state = lock_state();
-    let s = match state.as_ref() {
-        Some(s) => s,
-        None => return,
-    };
+    let (hwnd, countdown_ms, reset_action) = {
+        let mut state = lock_state();
+        let Some(s) = state.as_mut() else {
+            return;
+        };
 
-    let hwnd = s.hwnd.to_hwnd();
-    if !s.last_poll_ok {
-        unsafe {
-            let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
-            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+        let hwnd = s.hwnd.to_hwnd();
+        if !s.last_poll_ok {
+            s.reset_poll_active = false;
+            s.reset_poll_attempts = 0;
+            drop(state);
+            unsafe {
+                let _ = KillTimer(hwnd, TIMER_COUNTDOWN);
+                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+            }
+            return;
         }
-        return;
-    }
 
-    let data = match &s.data {
-        Some(d) => d,
-        None => return,
+        let Some(data) = s.data.as_ref() else {
+            return;
+        };
+
+        let past_reset = poller::app_is_past_reset(data);
+        let delays = [
+            data.claude_code
+                .as_ref()
+                .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            data.claude_code
+                .as_ref()
+                .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+            data.codex
+                .as_ref()
+                .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
+            data.codex
+                .as_ref()
+                .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
+        ];
+        let min_delay = delays.into_iter().flatten().min();
+        let countdown_ms = min_delay
+            .unwrap_or(Duration::from_secs(60))
+            .as_millis()
+            .max(1000) as u32;
+
+        let reset_action = if past_reset {
+            if s.reset_poll_active {
+                ResetPollAction::Leave
+            } else {
+                match poll_schedule::reset_poll_delay_ms(s.reset_poll_attempts) {
+                    Some(ms) => {
+                        s.reset_poll_active = true;
+                        ResetPollAction::Arm(ms)
+                    }
+                    // Budget exhausted: wait for the regular poll interval.
+                    None => ResetPollAction::Leave,
+                }
+            }
+        } else {
+            s.reset_poll_active = false;
+            s.reset_poll_attempts = 0;
+            ResetPollAction::Stop
+        };
+
+        (hwnd, countdown_ms, reset_action)
     };
-
-    // If a reset time has passed, poll every 5s to pick up fresh data
-    if poller::app_is_past_reset(data) {
-        unsafe {
-            SetTimer(hwnd, TIMER_RESET_POLL, 5_000, None);
-        }
-    }
-
-    let delays = [
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.claude_code
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.session.resets_at)),
-        data.codex
-            .as_ref()
-            .and_then(|usage| poller::time_until_display_change(usage.weekly.resets_at)),
-    ];
-    let min_delay = delays.into_iter().flatten().min();
-
-    let ms = min_delay
-        .unwrap_or(Duration::from_secs(60))
-        .as_millis()
-        .max(1000) as u32;
 
     unsafe {
-        SetTimer(hwnd, TIMER_COUNTDOWN, ms, None);
+        match reset_action {
+            ResetPollAction::Arm(ms) => {
+                SetTimer(hwnd, TIMER_RESET_POLL, ms, None);
+            }
+            ResetPollAction::Stop => {
+                let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+            }
+            ResetPollAction::Leave => {}
+        }
+        SetTimer(hwnd, TIMER_COUNTDOWN, countdown_ms, None);
     }
 }
 
@@ -1694,7 +1867,9 @@ fn tray_reposition_is_suppressed() -> bool {
     }
 }
 
-fn position_at_taskbar() {
+/// Move the widget next to the tray. Returns true if the window was actually
+/// moved, false if it was skipped or already at the computed placement.
+fn position_at_taskbar() -> bool {
     refresh_dpi();
     // Drop the app-state lock before any Win32 call that may synchronously
     // re-enter our window procedure.
@@ -1702,19 +1877,19 @@ fn position_at_taskbar() {
         let state = lock_state();
         let s = match state.as_ref() {
             Some(s) => s,
-            None => return,
+            None => return false,
         };
 
         // Don't fight the user's drag
         if s.dragging {
-            return;
+            return false;
         }
 
         let taskbar_hwnd = match s.taskbar_hwnd {
             Some(h) => h,
             None => {
                 diagnose::log("position_at_taskbar skipped: no taskbar handle");
-                return;
+                return false;
             }
         };
 
@@ -1725,7 +1900,7 @@ fn position_at_taskbar() {
         Some(r) => r,
         None => {
             diagnose::log("position_at_taskbar skipped: unable to query taskbar rect");
-            return;
+            return false;
         }
     };
 
@@ -1744,22 +1919,33 @@ fn position_at_taskbar() {
 
     let widget_height = sc(WIDGET_HEIGHT);
     let y = compute_anchor_y(anchor_top, anchor_height, widget_height);
-    if embedded {
+    let (x, y, label) = if embedded {
         // Child window: coordinates relative to parent (taskbar)
         let x = tray_left - taskbar_rect.left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y - taskbar_rect.top, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned embedded widget at x={x} y={} w={widget_width} h={widget_height}",
-            y - taskbar_rect.top
-        ));
+        (x, y - taskbar_rect.top, "embedded")
     } else {
         // Topmost popup: screen coordinates
         let x = tray_left - widget_width - tray_offset;
-        native_interop::move_window(hwnd, x, y, widget_width, widget_height);
-        diagnose::log(format!(
-            "positioned fallback widget at x={x} y={y} w={widget_width} h={widget_height}"
-        ));
+        (x, y, "fallback")
+    };
+
+    // Moving a child of the taskbar makes the tray emit another location-change
+    // event, which would call us again; only touch the window when the
+    // placement really changed so that loop terminates.
+    let placement = (x, y, widget_width, widget_height);
+    {
+        let mut last = LAST_PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+        if *last == Some(placement) {
+            return false;
+        }
+        *last = Some(placement);
     }
+
+    native_interop::move_window(hwnd, x, y, widget_width, widget_height);
+    diagnose::log(format!(
+        "positioned {label} widget at x={x} y={y} w={widget_width} h={widget_height}"
+    ));
+    true
 }
 
 fn compute_anchor_y(anchor_top: i32, anchor_height: i32, widget_height: i32) -> i32 {
@@ -1806,8 +1992,9 @@ unsafe extern "system" fn on_tray_location_changed(
                 false
             }
         };
-        if should_reposition {
-            position_at_taskbar();
+        // Only re-render when the widget actually moved; otherwise every tray
+        // animation would cost a full layered-window redraw.
+        if should_reposition && position_at_taskbar() {
             render_layered();
         }
     }
@@ -1851,6 +2038,7 @@ unsafe extern "system" fn wnd_proc(
                 check_language_change();
             }
             refresh_dpi();
+            invalidate_placement_cache();
             position_at_taskbar();
             render_layered();
             LRESULT(0)
@@ -1859,43 +2047,9 @@ unsafe extern "system" fn wnd_proc(
             let timer_id = wparam.0;
             match timer_id {
                 TIMER_POLL => {
-                    let auth_watch = {
-                        let state = lock_state();
-                        state.as_ref().map(|s| {
-                            (
-                                s.auth_error_paused_polling,
-                                s.auth_watch_mode,
-                                s.auth_watch_snapshot.clone(),
-                            )
-                        })
-                    };
-                    match auth_watch {
-                        Some((true, watch_mode, previous_snapshot)) => {
-                            let current_snapshot = poller::credential_watch_snapshot(watch_mode);
-                            if current_snapshot != previous_snapshot {
-                                let mut state = lock_state();
-                                if let Some(s) = state.as_mut() {
-                                    if s.auth_error_paused_polling
-                                        && s.auth_watch_mode == watch_mode
-                                    {
-                                        s.auth_watch_snapshot = current_snapshot;
-                                    }
-                                }
-                                drop(state);
-                                let sh = SendHwnd::from_hwnd(hwnd);
-                                std::thread::spawn(move || {
-                                    do_poll(sh);
-                                });
-                            }
-                        }
-                        Some((false, _, _)) => {
-                            let sh = SendHwnd::from_hwnd(hwnd);
-                            std::thread::spawn(move || {
-                                do_poll(sh);
-                            });
-                        }
-                        None => {}
-                    }
+                    // The auth-watch credential check (which runs wsl.exe) now
+                    // happens inside the worker, never on this UI thread.
+                    spawn_poll(hwnd, PollReason::Interval);
                 }
                 TIMER_COUNTDOWN => {
                     update_display();
@@ -1903,18 +2057,39 @@ unsafe extern "system" fn wnd_proc(
                     schedule_countdown_timer();
                 }
                 TIMER_RESET_POLL => {
-                    let should_poll = {
-                        let state = lock_state();
-                        state
-                            .as_ref()
-                            .map(|s| !s.auth_error_paused_polling)
-                            .unwrap_or(false)
+                    // Bounded fast polling after a usage window reset: each tick
+                    // moves to the next back-off step and the burst ends after
+                    // RESET_POLL_MAX_ATTEMPTS polls (see poll_schedule.rs).
+                    let next_delay = {
+                        let mut state = lock_state();
+                        match state.as_mut() {
+                            Some(s) if !s.auth_error_paused_polling => {
+                                s.reset_poll_attempts = s.reset_poll_attempts.saturating_add(1);
+                                let next =
+                                    poll_schedule::reset_poll_delay_ms(s.reset_poll_attempts);
+                                if next.is_none() {
+                                    s.reset_poll_active = false;
+                                }
+                                Some(next)
+                            }
+                            _ => None,
+                        }
                     };
-                    if should_poll {
-                        let sh = SendHwnd::from_hwnd(hwnd);
-                        std::thread::spawn(move || {
-                            do_poll(sh);
-                        });
+                    match next_delay {
+                        Some(Some(ms)) => {
+                            SetTimer(hwnd, TIMER_RESET_POLL, ms, None);
+                            spawn_poll(hwnd, PollReason::ResetWatch);
+                        }
+                        Some(None) => {
+                            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                            diagnose::log(
+                                "reset fast-poll budget exhausted; waiting for the regular poll interval",
+                            );
+                            spawn_poll(hwnd, PollReason::ResetWatch);
+                        }
+                        None => {
+                            let _ = KillTimer(hwnd, TIMER_RESET_POLL);
+                        }
                     }
                 }
                 TIMER_UPDATE_CHECK => {
@@ -1925,6 +2100,7 @@ unsafe extern "system" fn wnd_proc(
             LRESULT(0)
         }
         WM_APP_USAGE_UPDATED => {
+            apply_pending_poll_timer(hwnd);
             check_theme_change();
             check_language_change();
             render_layered();
@@ -2115,10 +2291,7 @@ unsafe extern "system" fn wnd_proc(
                         }
                     }
                     render_layered();
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    spawn_poll(hwnd, PollReason::UserRefresh);
                 }
                 IDM_VERSION_ACTION => {
                     let release = {
@@ -2183,16 +2356,13 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
+                            // At least one model must stay visible.
                             match id {
-                                IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || !s.show_claude_code {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
+                                IDM_MODEL_CLAUDE_CODE if s.show_codex || !s.show_claude_code => {
+                                    s.show_claude_code = !s.show_claude_code;
                                 }
-                                IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
+                                IDM_MODEL_CODEX if s.show_claude_code || !s.show_codex => {
+                                    s.show_codex = !s.show_codex;
                                 }
                                 _ => {}
                             }
@@ -2206,10 +2376,7 @@ unsafe extern "system" fn wnd_proc(
                     position_at_taskbar();
                     render_layered();
                     sync_tray_icons(hwnd);
-                    let sh = SendHwnd::from_hwnd(hwnd);
-                    std::thread::spawn(move || {
-                        do_poll(sh);
-                    });
+                    spawn_poll(hwnd, PollReason::ModelChanged);
                 }
                 IDM_LANG_SYSTEM
                 | IDM_LANG_ENGLISH
@@ -2621,6 +2788,7 @@ fn paint(hdc: HDC, hwnd: HWND) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_row(
     hdc: HDC,
     x: i32,
@@ -2706,6 +2874,7 @@ fn model_usage_width(segment_count: i32) -> i32 {
         + sc(TEXT_WIDTH)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_usage_bar(
     hdc: HDC,
     bar_x: i32,
@@ -2803,5 +2972,57 @@ fn draw_rounded_rect(hdc: HDC, rect: &RECT, color: &Color, radius: i32) {
         let _ = FillRgn(hdc, rgn, brush);
         let _ = DeleteObject(rgn);
         let _ = DeleteObject(brush);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_anchor_y_clamps_to_taskbar_top() {
+        // Widget shorter than the taskbar: bottom-aligned.
+        assert_eq!(compute_anchor_y(100, 60, 46), 114);
+        // Widget taller than the taskbar: never above the taskbar top.
+        assert_eq!(compute_anchor_y(100, 40, 46), 100);
+    }
+
+    #[test]
+    fn auto_update_check_due_respects_interval() {
+        assert!(auto_update_check_due(None));
+        let now = now_unix_secs();
+        assert!(!auto_update_check_due(Some(now - 23 * 3600)));
+        assert!(auto_update_check_due(Some(now - 25 * 3600)));
+        // A timestamp from the future must not underflow into "due".
+        assert!(!auto_update_check_due(Some(now + 3600)));
+    }
+
+    #[test]
+    fn active_model_count_is_at_least_one() {
+        assert_eq!(active_model_count(false, false), 1);
+        assert_eq!(active_model_count(true, false), 1);
+        assert_eq!(active_model_count(true, true), 2);
+        assert_eq!(row_bar_segment_count(1), SEGMENT_COUNT);
+        assert_eq!(row_bar_segment_count(2), 5);
+    }
+
+    #[test]
+    fn widget_width_is_positive_and_grows_with_models() {
+        let one = total_widget_width_for(1);
+        let two = total_widget_width_for(2);
+        assert!(one > 0);
+        assert!(two > one);
+        assert!(poll_schedule::pixel_count(one, WIDGET_HEIGHT).is_some());
+    }
+
+    #[test]
+    fn placement_cache_invalidation_forces_next_move() {
+        {
+            let mut last = LAST_PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+            *last = Some((1, 2, 3, 4));
+        }
+        invalidate_placement_cache();
+        let last = LAST_PLACEMENT.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(*last, None);
     }
 }

@@ -1,5 +1,6 @@
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::Shell::{SHAppBarMessage, ABM_GETTASKBARPOS, APPBARDATA};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -144,6 +145,87 @@ pub fn unhook_win_event(hook: HWINEVENTHOOK) {
 /// Convert a Rust string to a null-terminated wide string
 pub fn wide_str(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Largest buffer we are willing to allocate for the module path (in UTF-16 units).
+const MAX_MODULE_PATH_UNITS: usize = 32_768;
+
+/// NUL-terminated UTF-16 path of the running executable.
+///
+/// `GetModuleFileNameW` truncates silently and returns the buffer size when the
+/// path does not fit (and on some Windows versions leaves the buffer without a
+/// terminating NUL). Callers used to pass a fixed 260-unit array and treat any
+/// non-zero return as success, which could hand an unterminated buffer to
+/// `ExtractIconExW` or read one unit past the end of the array. This helper
+/// grows the buffer until the whole path fits and always returns a terminated
+/// string (the trailing 0 is included in the returned vector).
+pub fn current_module_path_wide() -> Option<Vec<u16>> {
+    let mut capacity = 260usize;
+    loop {
+        let mut buf = vec![0u16; capacity];
+        let len = unsafe { GetModuleFileNameW(None, &mut buf) } as usize;
+        if len == 0 {
+            return None;
+        }
+        if len < buf.len() {
+            buf.truncate(len + 1);
+            buf[len] = 0;
+            return Some(buf);
+        }
+        if capacity >= MAX_MODULE_PATH_UNITS {
+            return None;
+        }
+        capacity = (capacity * 2).min(MAX_MODULE_PATH_UNITS);
+    }
+}
+
+/// Path of the running executable as a Rust string (no trailing NUL).
+pub fn current_module_path() -> Option<String> {
+    let wide = current_module_path_wide()?;
+    let without_nul = wide.strip_suffix(&[0u16]).unwrap_or(&wide);
+    Some(String::from_utf16_lossy(without_nul))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_str_is_nul_terminated() {
+        let wide = wide_str("ab");
+        assert_eq!(wide, vec![b'a' as u16, b'b' as u16, 0]);
+        assert_eq!(wide_str(""), vec![0]);
+    }
+
+    #[test]
+    fn color_from_hex_and_colorref_round_trip() {
+        let c = Color::from_hex("#D97757");
+        assert_eq!((c.r, c.g, c.b), (0xD9, 0x77, 0x57));
+        // COLORREF is 0x00BBGGRR.
+        assert_eq!(c.to_colorref(), 0x0057_77D9);
+        assert_eq!(colorref(1, 2, 3), 0x0003_0201);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn current_module_path_wide_is_nul_terminated_and_matches_current_exe() {
+        let wide = current_module_path_wide().expect("module path");
+        assert_eq!(wide.last(), Some(&0), "must be NUL-terminated");
+        assert!(
+            !wide[..wide.len() - 1].contains(&0),
+            "no interior NUL units"
+        );
+
+        let decoded = current_module_path().expect("module path string");
+        let expected = std::env::current_exe()
+            .expect("current_exe")
+            .to_string_lossy()
+            .to_string();
+        assert!(
+            decoded.eq_ignore_ascii_case(&expected),
+            "{decoded} != {expected}"
+        );
+    }
 }
 
 /// COLORREF wrapper (RGB packed into u32)

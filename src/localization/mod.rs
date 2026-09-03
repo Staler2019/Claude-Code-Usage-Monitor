@@ -4,10 +4,10 @@ mod french;
 mod german;
 mod japanese;
 mod korean;
+mod portuguese_brazil;
+mod russian;
 mod spanish;
 mod traditional_chinese;
-mod russian;
-mod portuguese_brazil;
 
 use windows::core::PWSTR;
 use windows::Win32::Globalization::{

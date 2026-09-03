@@ -89,6 +89,8 @@ This writes a log file to:
 %LOCALAPPDATA%\claude-code-usage-monitor.log
 ```
 
+The log includes the process's GDI and USER object counts and a poll counter on every poll and tray-icon update (`gdi=… user=… polls_started=… polls_skipped=…`). Those counts should stay flat over time; a steadily climbing number indicates a resource leak worth reporting.
+
 Settings are saved to:
 
 ```text
@@ -151,6 +153,14 @@ Security hardening details:
 - The `--apply-update` flag rejects non-absolute paths and any path containing `../` to prevent overwriting arbitrary files
 - Downloaded updates are verified against a SHA-256 checksum published alongside the release before being applied; a missing or mismatched checksum aborts the update
 - The polling interval from settings is clamped to between 60 seconds and 24 hours, preventing rapid-polling DoS from a tampered settings file
+- At most one usage poll runs at a time; timer ticks that arrive while a poll is in flight are dropped instead of spawning additional background threads and `wsl.exe` processes (a manual **Refresh** is queued to run once the current poll finishes)
+- After a usage window resets, the fast "has the new window started?" poll backs off from 5 s to 160 s and stops after six attempts instead of polling every 5 seconds indefinitely
+- Every background CLI / WSL process runs under a timeout, has its output drained so it can never block on a full pipe, and is always reaped (waited on) after being killed
+- Tray icon handles are created and destroyed in matched pairs, icons that did not change are not rebuilt, and bitmap buffer sizes handed to GDI are computed with the WORD-aligned formula GDI expects, so the process's USER/GDI object counts stay flat for as long as the app runs
+- Credential-change detection (which may launch `wsl.exe`) runs on a background thread, never on the thread that owns the taskbar widget
+- CI runs a handle-count regression test on Windows that fails if creating and destroying tray icons leaks GDI or USER objects
+
+Together these guard against the kind of unbounded kernel-object and process churn from a user-mode app that can push Windows into a `PAGE_FAULT_IN_NONPAGED_AREA` bugcheck.
 
 Notes:
 
