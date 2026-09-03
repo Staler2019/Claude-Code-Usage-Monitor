@@ -2356,16 +2356,13 @@ unsafe extern "system" fn wnd_proc(
                     {
                         let mut state = lock_state();
                         if let Some(s) = state.as_mut() {
+                            // At least one model must stay visible.
                             match id {
-                                IDM_MODEL_CLAUDE_CODE => {
-                                    if s.show_codex || !s.show_claude_code {
-                                        s.show_claude_code = !s.show_claude_code;
-                                    }
+                                IDM_MODEL_CLAUDE_CODE if s.show_codex || !s.show_claude_code => {
+                                    s.show_claude_code = !s.show_claude_code;
                                 }
-                                IDM_MODEL_CODEX => {
-                                    if s.show_claude_code || !s.show_codex {
-                                        s.show_codex = !s.show_codex;
-                                    }
+                                IDM_MODEL_CODEX if s.show_claude_code || !s.show_codex => {
+                                    s.show_codex = !s.show_codex;
                                 }
                                 _ => {}
                             }
