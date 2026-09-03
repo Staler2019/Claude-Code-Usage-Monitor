@@ -1,6 +1,9 @@
+use std::io::Read;
 use std::path::PathBuf;
-use std::process::Command;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::Receiver;
+use std::sync::OnceLock;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Deserialize;
 use std::os::windows::process::CommandExt;
@@ -13,6 +16,13 @@ const USAGE_URL: &str = "https://api.anthropic.com/api/oauth/usage";
 const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// How long a CLI token refresh (`claude -p .` / `codex exec .`) may run.
+const CLI_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a `--version` / `where.exe` probe may run while locating a CLI.
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long to wait for a finished child's pipe reader after the child exited.
+const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
 
@@ -202,21 +212,8 @@ fn cli_refresh_windows_token() {
         }
     };
 
-    // Wait up to 30 seconds — don't block the poll thread forever
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            Err(_) => break,
-        }
-    }
+    // Bounded wait; the child is killed *and reaped* on timeout.
+    let _ = wait_with_deadline(&mut child, CLI_REFRESH_TIMEOUT);
 }
 
 fn cli_refresh_wsl_token(distro: &str) {
@@ -245,7 +242,7 @@ fn cli_refresh_wsl_token(distro: &str) {
         }
     };
 
-    wait_for_refresh(&mut child);
+    let _ = wait_with_deadline(&mut child, CLI_REFRESH_TIMEOUT);
 }
 
 fn cli_refresh_codex_token() {
@@ -289,17 +286,71 @@ fn cli_refresh_codex_token() {
         }
     };
 
-    wait_for_refresh(&mut child);
+    let _ = wait_with_deadline(&mut child, CLI_REFRESH_TIMEOUT);
 }
 
 /// Spawn a command and wait up to `timeout` for it to finish.
+///
+/// Piped stdout/stderr are drained on helper threads while waiting, so a child
+/// that writes more than the pipe buffer (a few KB, easily exceeded by a
+/// credentials file) can never block on a full pipe and then get killed at the
+/// deadline on every poll. The child is always reaped: on timeout or error it
+/// is killed and waited on before returning.
+///
 /// Returns None if the process fails to start or exceeds the deadline.
-fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process::Output> {
+fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<Output> {
     let mut child = cmd.spawn().ok()?;
-    let start = std::time::Instant::now();
+
+    let stdout_rx = spawn_pipe_reader(child.stdout.take());
+    let stderr_rx = spawn_pipe_reader(child.stderr.take());
+
+    let status = wait_with_deadline(&mut child, timeout)?;
+
+    // The child has exited, so its ends of the pipes are closed and the readers
+    // finish as soon as they hit EOF. A grandchild that inherited the pipe could
+    // in theory hold it open; bound that wait rather than hang the poll thread.
+    let stdout = collect_pipe(stdout_rx)?;
+    let stderr = collect_pipe(stderr_rx)?;
+
+    Some(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+/// Read a child's pipe to EOF on a helper thread; the result arrives on the
+/// returned channel. `None` if the pipe was not captured.
+fn spawn_pipe_reader<R: Read + Send + 'static>(pipe: Option<R>) -> Option<Receiver<Vec<u8>>> {
+    let mut pipe = pipe?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    Some(rx)
+}
+
+fn collect_pipe(rx: Option<Receiver<Vec<u8>>>) -> Option<Vec<u8>> {
+    match rx {
+        Some(rx) => rx.recv_timeout(PIPE_DRAIN_GRACE).ok(),
+        None => Some(Vec::new()),
+    }
+}
+
+/// Wait for `child` to exit, killing it if it runs longer than `timeout`.
+///
+/// Returns the exit status, or None if the child had to be killed or could not
+/// be observed. In every case the child is reaped (`wait` after `kill`), so no
+/// zombie process object or handle is left behind. The old code broke out of
+/// the loop right after `kill()`, leaking the process object each time a CLI
+/// refresh timed out.
+fn wait_with_deadline(child: &mut Child, timeout: Duration) -> Option<ExitStatus> {
+    let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(Some(status)) => return Some(status),
             Ok(None) => {
                 if start.elapsed() > timeout {
                     let _ = child.kill();
@@ -308,106 +359,102 @@ fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> Option<std::process
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => return None,
-        }
-    }
-}
-
-fn wait_for_refresh(child: &mut std::process::Child) {
-    // Wait up to 30 seconds; don't block the poll thread forever.
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) => {
-                if start.elapsed() > Duration::from_secs(30) {
-                    let _ = child.kill();
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(500));
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
-            Err(_) => break,
         }
     }
 }
 
 /// Resolve the full path to the `claude` CLI executable.
 fn resolve_windows_claude_path() -> String {
-    for name in &["claude.cmd", "claude"] {
-        if Command::new(name)
-            .arg("--version")
-            .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
-        }
-    }
-
-    for name in &["claude.cmd", "claude"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
-            .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
-                }
-            }
-        }
-    }
-
-    "claude.cmd".to_string()
+    static CACHED: OnceLock<String> = OnceLock::new();
+    resolve_cli_path_cached(&CACHED, &["claude.cmd", "claude"], "claude.cmd")
 }
 
 fn resolve_windows_codex_path() -> String {
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if Command::new(name)
-            .arg("--version")
+    static CACHED: OnceLock<String> = OnceLock::new();
+    resolve_cli_path_cached(
+        &CACHED,
+        &["codex.cmd", "codex.ps1", "codex.exe", "codex"],
+        "codex.cmd",
+    )
+}
+
+/// Locate a CLI once per process. Only successful lookups are cached, so a CLI
+/// installed while the monitor is running is still picked up.
+fn resolve_cli_path_cached(
+    cache: &OnceLock<String>,
+    candidates: &[&str],
+    fallback: &str,
+) -> String {
+    if let Some(cached) = cache.get() {
+        return cached.clone();
+    }
+    match resolve_cli_path(candidates) {
+        Some(path) => {
+            let _ = cache.set(path.clone());
+            path
+        }
+        None => fallback.to_string(),
+    }
+}
+
+/// Probe `<candidate> --version` and then `where.exe <candidate>`. Every probe
+/// runs under a timeout: previously these used `.status()` / `.output()` with
+/// no deadline, so a hung CLI pinned the poll thread forever.
+fn resolve_cli_path(candidates: &[&str]) -> Option<String> {
+    for name in candidates {
+        let mut cmd = Command::new(name);
+        cmd.arg("--version")
             .creation_flags(CREATE_NO_WINDOW)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-        {
-            return name.to_string();
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        if run_with_timeout(&mut cmd, CLI_PROBE_TIMEOUT).is_some() {
+            return Some(name.to_string());
         }
     }
 
-    for name in &["codex.cmd", "codex.ps1", "codex.exe", "codex"] {
-        if let Ok(output) = Command::new("where.exe")
-            .arg(name)
+    for name in candidates {
+        let mut cmd = Command::new("where.exe");
+        cmd.arg(name)
             .creation_flags(CREATE_NO_WINDOW)
-            .output()
-        {
-            if output.status.success() {
-                let stdout = String::from_utf8_lossy(&output.stdout);
-                if let Some(first_line) = stdout.lines().next() {
-                    let path = first_line.trim().to_string();
-                    if !path.is_empty() {
-                        return path;
-                    }
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let Some(output) = run_with_timeout(&mut cmd, CLI_PROBE_TIMEOUT) else {
+            continue;
+        };
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if let Some(first_line) = stdout.lines().next() {
+                let path = first_line.trim().to_string();
+                if !path.is_empty() {
+                    return Some(path);
                 }
             }
         }
     }
 
-    "codex.cmd".to_string()
+    None
 }
 
+/// One HTTP agent for the whole process: a single TLS connector and a shared
+/// connection pool instead of a fresh TLS stack (and socket) per request.
 fn build_agent() -> Result<ureq::Agent, PollError> {
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    if let Some(agent) = AGENT.get() {
+        return Ok(agent.clone());
+    }
     let tls = native_tls::TlsConnector::new().map_err(|_| PollError::RequestFailed)?;
-    Ok(ureq::AgentBuilder::new()
+    let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .tls_connector(std::sync::Arc::new(tls))
-        .build())
+        .build();
+    Ok(AGENT.get_or_init(|| agent).clone())
 }
 
 pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSnapshot {
@@ -1198,4 +1245,441 @@ pub fn is_past_reset(data: &UsageData) -> bool {
 pub fn app_is_past_reset(data: &AppUsageData) -> bool {
     data.claude_code.as_ref().is_some_and(is_past_reset)
         || data.codex.as_ref().is_some_and(is_past_reset)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::localization::LanguageId;
+
+    fn en() -> Strings {
+        LanguageId::English.strings()
+    }
+
+    // -- child process handling --
+
+    #[test]
+    fn run_with_timeout_returns_none_for_missing_binary() {
+        let mut cmd = Command::new("definitely-not-a-real-binary-ccum");
+        cmd.creation_flags(CREATE_NO_WINDOW);
+        assert!(run_with_timeout(&mut cmd, Duration::from_secs(1)).is_none());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_returns_status_and_output_for_quick_commands() {
+        let mut cmd = Command::new("cmd.exe");
+        cmd.raw_arg("/c echo hello")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let output = run_with_timeout(&mut cmd, Duration::from_secs(10)).expect("echo completes");
+        assert!(output.status.success());
+        assert!(String::from_utf8_lossy(&output.stdout).starts_with("hello"));
+
+        let mut failing = Command::new("cmd.exe");
+        failing
+            .raw_arg("/c exit 3")
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let output =
+            run_with_timeout(&mut failing, Duration::from_secs(10)).expect("exit completes");
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stdout.is_empty());
+    }
+
+    /// Regression test for the pipe deadlock: the old implementation never read
+    /// stdout while waiting, so a child that wrote more than the pipe buffer
+    /// blocked until the deadline and every poll failed.
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_drains_large_stdout() {
+        const LINES: usize = 4_000;
+        let line = "0123456789012345678901234567890123456789012345678"; // 49 chars
+        let mut cmd = Command::new("cmd.exe");
+        cmd.raw_arg(format!("/c for /L %i in (1,1,{LINES}) do @echo {line}"))
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let started = Instant::now();
+        let output =
+            run_with_timeout(&mut cmd, Duration::from_secs(20)).expect("must not deadlock");
+        assert!(output.status.success());
+        assert!(
+            output.stdout.len() >= LINES * line.len(),
+            "only {} bytes captured",
+            output.stdout.len()
+        );
+        assert!(started.elapsed() < Duration::from_secs(20));
+    }
+
+    /// Regression test for kill-without-wait: a child that overruns the
+    /// deadline must be killed *and* reaped, and the call must return promptly.
+    #[cfg(windows)]
+    #[test]
+    fn wait_with_deadline_kills_and_reaps_on_timeout() {
+        let mut cmd = Command::new("ping.exe");
+        cmd.args(["-n", "30", "127.0.0.1"])
+            .creation_flags(CREATE_NO_WINDOW)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = cmd.spawn().expect("ping.exe spawns");
+
+        let started = Instant::now();
+        assert!(wait_with_deadline(&mut child, Duration::from_millis(500)).is_none());
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "kill must not wait for ping"
+        );
+        // Reaped: the exit status is now known without blocking.
+        assert!(matches!(child.try_wait(), Ok(Some(_))));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn run_with_timeout_is_repeatable_after_a_timeout() {
+        for _ in 0..3 {
+            let mut cmd = Command::new("ping.exe");
+            cmd.args(["-n", "30", "127.0.0.1"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null());
+            let started = Instant::now();
+            assert!(run_with_timeout(&mut cmd, Duration::from_millis(300)).is_none());
+            assert!(started.elapsed() < Duration::from_secs(5));
+        }
+    }
+
+    // -- clamp_utilization --
+
+    #[test]
+    fn clamp_utilization_passes_through_normal_values() {
+        assert_eq!(clamp_utilization(0.0), 0.0);
+        assert_eq!(clamp_utilization(0.5), 0.5);
+        assert_eq!(clamp_utilization(1.0), 1.0);
+    }
+
+    #[test]
+    fn clamp_utilization_clamps_above_one() {
+        assert_eq!(clamp_utilization(1.5), 1.0);
+        assert_eq!(clamp_utilization(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn clamp_utilization_floors_negative_and_nan() {
+        assert_eq!(clamp_utilization(-0.5), 0.0);
+        assert_eq!(clamp_utilization(f64::NAN), 0.0);
+    }
+
+    // -- parse_iso8601 / parse_datetime_to_unix --
+
+    #[test]
+    fn parse_iso8601_returns_none_for_missing_input() {
+        assert!(parse_iso8601(None).is_none());
+    }
+
+    #[test]
+    fn parse_iso8601_parses_utc_zulu_timestamp() {
+        let parsed = parse_iso8601(Some("2026-03-05T08:00:00Z")).unwrap();
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1772697600
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_parses_offset_timestamp_with_fractional_seconds() {
+        let parsed = parse_iso8601(Some("2026-03-05T08:00:00.321598+00:00")).unwrap();
+        assert_eq!(
+            parsed.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1772697600
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_malformed_input() {
+        assert!(parse_iso8601(Some("not-a-date")).is_none());
+        assert!(parse_iso8601(Some("2026-13-40T99:99:99")).is_none());
+    }
+
+    #[test]
+    fn parse_datetime_to_unix_matches_known_epoch_values() {
+        assert_eq!(parse_datetime_to_unix("1970-01-01T00:00:00", ""), Ok(0));
+        // 2000-03-01 accounts for the Feb 29 2000 leap day correctly.
+        assert_eq!(
+            parse_datetime_to_unix("2000-03-01T00:00:00", ""),
+            Ok(951868800)
+        );
+    }
+
+    // -- is_leap --
+
+    #[test]
+    fn is_leap_identifies_leap_years() {
+        assert!(is_leap(2000));
+        assert!(is_leap(2024));
+        assert!(!is_leap(1900));
+        assert!(!is_leap(2023));
+    }
+
+    // -- unix_to_system_time --
+
+    #[test]
+    fn unix_to_system_time_converts_valid_timestamp() {
+        let t = unix_to_system_time(Some(1000)).unwrap();
+        assert_eq!(t.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1000);
+    }
+
+    #[test]
+    fn unix_to_system_time_rejects_none_negative_and_far_future() {
+        assert!(unix_to_system_time(None).is_none());
+        assert!(unix_to_system_time(Some(-1)).is_none());
+        assert!(unix_to_system_time(Some(7_258_118_401)).is_none());
+    }
+
+    // -- is_token_expired --
+
+    #[test]
+    fn is_token_expired_true_for_past_timestamp() {
+        assert!(is_token_expired(Some(1)));
+    }
+
+    #[test]
+    fn is_token_expired_false_for_far_future_timestamp() {
+        let far_future_ms = (SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64)
+            + 60_000;
+        assert!(!is_token_expired(Some(far_future_ms)));
+    }
+
+    #[test]
+    fn is_token_expired_false_when_missing() {
+        assert!(!is_token_expired(None));
+    }
+
+    // -- format_countdown_from_secs / time_until_display_change_from_secs --
+
+    #[test]
+    fn format_countdown_from_secs_picks_largest_unit() {
+        assert_eq!(
+            format_countdown_from_secs(30, en()),
+            format!("30{}", en().second_suffix)
+        );
+        assert_eq!(
+            format_countdown_from_secs(90, en()),
+            format!("1{}", en().minute_suffix)
+        );
+        assert_eq!(
+            format_countdown_from_secs(3700, en()),
+            format!("1{}", en().hour_suffix)
+        );
+        assert_eq!(
+            format_countdown_from_secs(90_000, en()),
+            format!("1{}", en().day_suffix)
+        );
+    }
+
+    #[test]
+    fn time_until_display_change_from_secs_ticks_to_next_bucket_boundary() {
+        // 90 seconds -> currently showing "1 minute", next change is when the
+        // minute count changes at 120s, i.e. in 30s (+1 for rounding safety).
+        assert_eq!(
+            time_until_display_change_from_secs(90),
+            Duration::from_secs(31)
+        );
+        // Under 60s counts down second by second.
+        assert_eq!(
+            time_until_display_change_from_secs(45),
+            Duration::from_secs(1)
+        );
+    }
+
+    // -- is_past_reset / app_is_past_reset --
+
+    #[test]
+    fn is_past_reset_true_when_reset_time_has_elapsed() {
+        let mut data = UsageData::default();
+        data.session.resets_at = Some(SystemTime::now() - Duration::from_secs(5));
+        assert!(is_past_reset(&data));
+    }
+
+    #[test]
+    fn is_past_reset_false_when_reset_time_is_future_or_absent() {
+        let mut data = UsageData::default();
+        data.session.resets_at = Some(SystemTime::now() + Duration::from_secs(3600));
+        assert!(!is_past_reset(&data));
+
+        let empty = UsageData::default();
+        assert!(!is_past_reset(&empty));
+    }
+
+    #[test]
+    fn app_is_past_reset_checks_both_apps() {
+        let mut past = UsageData::default();
+        past.weekly.resets_at = Some(SystemTime::now() - Duration::from_secs(1));
+
+        let data = AppUsageData {
+            codex: Some(past),
+            ..Default::default()
+        };
+        assert!(app_is_past_reset(&data));
+
+        let empty = AppUsageData::default();
+        assert!(!app_is_past_reset(&empty));
+    }
+
+    // -- codex_usage_from_response / codex_section_from_window --
+
+    #[test]
+    fn codex_usage_from_response_maps_windows_to_sections() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: Some(Some(Box::new(CodexRateLimitWindow {
+                    used_percent: 12.5,
+                    reset_at: 1000,
+                }))),
+                secondary_window: Some(Some(Box::new(CodexRateLimitWindow {
+                    used_percent: 60.0,
+                    reset_at: 2000,
+                }))),
+            }))),
+        };
+
+        let data = codex_usage_from_response(response).unwrap();
+        assert_eq!(data.session.percentage, 12.5);
+        assert_eq!(
+            data.session
+                .resets_at
+                .unwrap()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+            1000
+        );
+        assert_eq!(data.weekly.percentage, 60.0);
+    }
+
+    #[test]
+    fn codex_usage_from_response_none_when_rate_limit_missing() {
+        let response = CodexUsageResponse { rate_limit: None };
+        assert!(codex_usage_from_response(response).is_none());
+
+        let response_null = CodexUsageResponse {
+            rate_limit: Some(None),
+        };
+        assert!(codex_usage_from_response(response_null).is_none());
+    }
+
+    #[test]
+    fn codex_usage_from_response_defaults_missing_windows() {
+        let response = CodexUsageResponse {
+            rate_limit: Some(Some(Box::new(CodexRateLimitDetails {
+                primary_window: None,
+                secondary_window: None,
+            }))),
+        };
+        let data = codex_usage_from_response(response).unwrap();
+        assert_eq!(data.session.percentage, 0.0);
+        assert_eq!(data.weekly.percentage, 0.0);
+    }
+
+    // -- is_safe_wsl_distro_name --
+
+    #[test]
+    fn is_safe_wsl_distro_name_accepts_typical_names() {
+        assert!(is_safe_wsl_distro_name("Ubuntu-22.04"));
+        assert!(is_safe_wsl_distro_name("Debian GNU_Linux"));
+    }
+
+    #[test]
+    fn is_safe_wsl_distro_name_rejects_empty_or_shell_metacharacters() {
+        assert!(!is_safe_wsl_distro_name(""));
+        assert!(!is_safe_wsl_distro_name("Ubuntu; rm -rf /"));
+        assert!(!is_safe_wsl_distro_name("$(whoami)"));
+        assert!(!is_safe_wsl_distro_name("a`b`"));
+        assert!(!is_safe_wsl_distro_name(&"a".repeat(257)));
+    }
+
+    // -- decode_utf16le / looks_like_utf16le / decode_wsl_text --
+
+    #[test]
+    fn decode_wsl_text_decodes_utf16le_with_bom() {
+        // 0xFF 0xFE is the little-endian UTF-16 BOM, followed by "hi" as UTF-16LE code units.
+        let mut bytes = vec![0xFF, 0xFE];
+        for ch in "hi".encode_utf16() {
+            bytes.extend_from_slice(&ch.to_le_bytes());
+        }
+        assert_eq!(decode_wsl_text(&bytes), "hi");
+    }
+
+    #[test]
+    fn decode_wsl_text_falls_back_to_utf8_for_plain_text() {
+        assert_eq!(decode_wsl_text(b"present|123|456"), "present|123|456");
+    }
+
+    #[test]
+    fn decode_wsl_text_handles_empty_input() {
+        assert_eq!(decode_wsl_text(b""), "");
+    }
+
+    // -- parse_credentials --
+
+    #[test]
+    fn parse_credentials_extracts_token_and_expiry() {
+        let json = r#"{"claudeAiOauth":{"accessToken":"abc123","expiresAt":9999999999}}"#;
+        let creds = parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json")),
+        )
+        .unwrap();
+        assert_eq!(creds.access_token, "abc123");
+        assert_eq!(creds.expires_at, Some(9999999999));
+    }
+
+    #[test]
+    fn parse_credentials_rejects_missing_oauth_block() {
+        assert!(parse_credentials(
+            "{}",
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_invalid_json() {
+        assert!(parse_credentials(
+            "not json",
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_empty_token() {
+        let json = r#"{"claudeAiOauth":{"accessToken":""}}"#;
+        assert!(parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn parse_credentials_rejects_control_characters_in_token() {
+        let json = "{\"claudeAiOauth\":{\"accessToken\":\"abc\\u0007def\"}}";
+        assert!(parse_credentials(
+            json,
+            CredentialSource::Windows(PathBuf::from("C:\\creds.json"))
+        )
+        .is_none());
+    }
 }
