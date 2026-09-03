@@ -614,17 +614,19 @@ fn clamp_utilization(raw: f64) -> f64 {
 fn parse_rate_limit_headers(response: &ureq::Response) -> UsageData {
     let mut data = UsageData::default();
 
-    data.session.percentage =
-        clamp_utilization(get_header_f64(response, "anthropic-ratelimit-unified-5h-utilization"))
-            * 100.0;
+    data.session.percentage = clamp_utilization(get_header_f64(
+        response,
+        "anthropic-ratelimit-unified-5h-utilization",
+    )) * 100.0;
     data.session.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-5h-reset",
     ));
 
-    data.weekly.percentage =
-        clamp_utilization(get_header_f64(response, "anthropic-ratelimit-unified-7d-utilization"))
-            * 100.0;
+    data.weekly.percentage = clamp_utilization(get_header_f64(
+        response,
+        "anthropic-ratelimit-unified-7d-utilization",
+    )) * 100.0;
     data.weekly.resets_at = unix_to_system_time(get_header_i64(
         response,
         "anthropic-ratelimit-unified-7d-reset",
@@ -902,7 +904,10 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
         diagnose::log("credential file contains an invalid access token (unexpected length)");
         return None;
     }
-    if !access_token.chars().all(|c| c.is_ascii() && !c.is_ascii_control()) {
+    if !access_token
+        .chars()
+        .all(|c| c.is_ascii() && !c.is_ascii_control())
+    {
         diagnose::log("credential file contains an access token with unexpected characters");
         return None;
     }
@@ -975,7 +980,9 @@ fn list_wsl_distros() -> Vec<String> {
             if is_safe_wsl_distro_name(name) {
                 true
             } else {
-                diagnose::log(format!("skipping WSL distro with unexpected name: {name:?}"));
+                diagnose::log(format!(
+                    "skipping WSL distro with unexpected name: {name:?}"
+                ));
                 false
             }
         })
