@@ -1,5 +1,6 @@
+use std::ffi::OsStr;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
 use std::sync::mpsc::Receiver;
 use std::sync::OnceLock;
@@ -25,6 +26,13 @@ const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PIPE_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 const MODEL_FALLBACK_CHAIN: &[&str] = &["claude-3-haiku-20240307", "claude-haiku-4-5-20251001"];
+
+/// Shell prologue that resolves `$CLAUDE_DIR` inside a WSL distro, honouring
+/// the distro's own `CLAUDE_CONFIG_DIR` the same way Claude Code does. The
+/// commands below run under a login shell, so a `CLAUDE_CONFIG_DIR` exported
+/// from the user's profile is picked up.
+#[cfg(feature = "wsl")]
+const WSL_CLAUDE_CONFIG_DIR_EXPR: &str = "CLAUDE_DIR=\"${CLAUDE_CONFIG_DIR:-$HOME/.claude}\"; ";
 
 #[derive(Debug)]
 pub enum PollError {
@@ -175,6 +183,7 @@ fn refresh_or_fallback(mut creds: Credentials) -> Result<Credentials, PollError>
 fn cli_refresh_token(source: &CredentialSource) {
     match source {
         CredentialSource::Windows(_) => cli_refresh_windows_token(),
+        #[cfg(feature = "wsl")]
         CredentialSource::Wsl { distro } => cli_refresh_wsl_token(distro),
     }
 }
@@ -216,6 +225,7 @@ fn cli_refresh_windows_token() {
     let _ = wait_with_deadline(&mut child, CLI_REFRESH_TIMEOUT);
 }
 
+#[cfg(feature = "wsl")]
 fn cli_refresh_wsl_token(distro: &str) {
     diagnose::log(format!(
         "attempting WSL Claude token refresh in distro {distro}"
@@ -475,26 +485,82 @@ pub fn credential_watch_snapshot(mode: CredentialWatchMode) -> CredentialWatchSn
 }
 
 fn all_known_credential_sources() -> Vec<CredentialSource> {
-    let mut sources = Vec::new();
-    if let Some(source) = windows_credential_source() {
-        sources.push(source);
-    }
-    for distro in list_wsl_distros() {
-        sources.push(CredentialSource::Wsl { distro });
-    }
+    let mut sources = windows_credential_sources();
+    sources.extend(wsl_credential_sources());
     sources
 }
 
-fn windows_credential_source() -> Option<CredentialSource> {
-    let home = dirs::home_dir()?;
-    Some(CredentialSource::Windows(
-        home.join(".claude").join(".credentials.json"),
-    ))
+#[cfg(feature = "wsl")]
+fn wsl_credential_sources() -> Vec<CredentialSource> {
+    list_wsl_distros()
+        .into_iter()
+        .map(|distro| CredentialSource::Wsl { distro })
+        .collect()
+}
+
+#[cfg(not(feature = "wsl"))]
+fn wsl_credential_sources() -> Vec<CredentialSource> {
+    Vec::new()
+}
+
+/// Normalize a `CLAUDE_CONFIG_DIR` value, treating blank values as unset.
+fn normalize_config_dir(value: &OsStr) -> Option<PathBuf> {
+    match value.to_str() {
+        Some(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| PathBuf::from(trimmed))
+        }
+        // Not valid UTF-8, so it cannot be trimmed; take it as-is.
+        None => (!value.is_empty()).then(|| PathBuf::from(value)),
+    }
+}
+
+/// Claude Code configuration directories to probe, in priority order.
+///
+/// Claude Code lets `CLAUDE_CONFIG_DIR` relocate its config directory away from
+/// `~/.claude`, so honour that first. The default location stays in the list as
+/// a fallback, matching how the WSL sources are tried in turn.
+fn claude_config_dirs_from(config_dir_env: Option<&OsStr>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+
+    if let Some(override_dir) = config_dir_env.and_then(normalize_config_dir) {
+        dirs.push(override_dir);
+    }
+
+    if let Some(default_dir) = home.map(|home| home.join(".claude")) {
+        if !dirs.contains(&default_dir) {
+            dirs.push(default_dir);
+        }
+    }
+
+    dirs
+}
+
+fn claude_config_dirs() -> Vec<PathBuf> {
+    claude_config_dirs_from(
+        std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+        dirs::home_dir().as_deref(),
+    )
+}
+
+fn claude_credential_paths() -> Vec<PathBuf> {
+    claude_config_dirs()
+        .into_iter()
+        .map(|dir| dir.join(".credentials.json"))
+        .collect()
+}
+
+fn windows_credential_sources() -> Vec<CredentialSource> {
+    claude_credential_paths()
+        .into_iter()
+        .map(CredentialSource::Windows)
+        .collect()
 }
 
 fn credential_watch_signature(source: &CredentialSource) -> Option<String> {
     match source {
         CredentialSource::Windows(path) => Some(windows_credential_watch_signature(path)),
+        #[cfg(feature = "wsl")]
         CredentialSource::Wsl { distro } => wsl_credential_watch_signature(distro),
     }
 }
@@ -515,6 +581,7 @@ fn windows_credential_watch_signature(path: &PathBuf) -> String {
     }
 }
 
+#[cfg(feature = "wsl")]
 fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
@@ -523,11 +590,12 @@ fn wsl_credential_watch_signature(distro: &str) -> Option<String> {
             .arg("--")
             .arg("sh")
             .arg("-lc")
-            .arg(
-                "if [ -f ~/.claude/.credentials.json ]; then \
-                 stat -c 'present|%s|%Y' ~/.claude/.credentials.json; \
-                 else echo missing; fi",
-            )
+            .arg(format!(
+                "{WSL_CLAUDE_CONFIG_DIR_EXPR}\
+                 if [ -f \"$CLAUDE_DIR/.credentials.json\" ]; then \
+                 stat -c 'present|%s|%Y' \"$CLAUDE_DIR/.credentials.json\"; \
+                 else echo missing; fi"
+            ))
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
@@ -807,7 +875,10 @@ impl Drop for Credentials {
 #[derive(Clone, Debug)]
 enum CredentialSource {
     Windows(PathBuf),
-    Wsl { distro: String },
+    #[cfg(feature = "wsl")]
+    Wsl {
+        distro: String,
+    },
 }
 
 fn read_first_credentials() -> Option<Credentials> {
@@ -815,12 +886,19 @@ fn read_first_credentials() -> Option<Credentials> {
         return Some(creds);
     }
 
-    for distro in list_wsl_distros() {
-        if let Some(creds) = read_wsl_credentials(&distro) {
-            return Some(creds);
-        }
-    }
+    read_first_wsl_credentials()
+}
 
+/// First usable credentials across the installed WSL distros, in listing order.
+#[cfg(feature = "wsl")]
+fn read_first_wsl_credentials() -> Option<Credentials> {
+    list_wsl_distros()
+        .into_iter()
+        .find_map(|distro| read_wsl_credentials(&distro))
+}
+
+#[cfg(not(feature = "wsl"))]
+fn read_first_wsl_credentials() -> Option<Credentials> {
     None
 }
 
@@ -831,10 +909,12 @@ fn path_is_symlink(path: &std::path::Path) -> bool {
 }
 
 fn read_windows_credentials() -> Option<Credentials> {
-    let CredentialSource::Windows(cred_path) = windows_credential_source()? else {
-        return None;
-    };
+    claude_credential_paths()
+        .into_iter()
+        .find_map(read_windows_credentials_at)
+}
 
+fn read_windows_credentials_at(cred_path: PathBuf) -> Option<Credentials> {
     // Refuse to follow symlinks — a symlink could redirect reads to an
     // attacker-controlled location, or be used to exfiltrate credentials.
     if path_is_symlink(&cred_path) || path_is_symlink(cred_path.parent().unwrap_or(&cred_path)) {
@@ -869,6 +949,7 @@ fn read_credentials_from_source(source: &CredentialSource) -> Option<Credentials
             let content = std::fs::read_to_string(path).ok()?;
             parse_credentials(&content, source.clone())
         }
+        #[cfg(feature = "wsl")]
         CredentialSource::Wsl { distro } => read_wsl_credentials(distro),
     }
 }
@@ -901,6 +982,7 @@ fn read_codex_credentials() -> Option<CodexTokenData> {
     auth.tokens.filter(|tokens| !tokens.access_token.is_empty())
 }
 
+#[cfg(feature = "wsl")]
 fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
     let output = run_with_timeout(
         Command::new("wsl.exe")
@@ -909,7 +991,9 @@ fn read_wsl_credentials(distro: &str) -> Option<Credentials> {
             .arg("--")
             .arg("sh")
             .arg("-lc")
-            .arg("cat ~/.claude/.credentials.json")
+            .arg(format!(
+                "{WSL_CLAUDE_CONFIG_DIR_EXPR}cat \"$CLAUDE_DIR/.credentials.json\""
+            ))
             .creation_flags(CREATE_NO_WINDOW)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null()),
@@ -965,13 +1049,22 @@ fn parse_credentials(content: &str, source: CredentialSource) -> Option<Credenti
 
 fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials> {
     match source {
-        CredentialSource::Windows(_) => {
-            for distro in list_wsl_distros() {
-                if let Some(creds) = read_wsl_credentials(&distro) {
+        CredentialSource::Windows(path) => {
+            let mut past_current = false;
+            for candidate_path in claude_credential_paths() {
+                if !past_current {
+                    past_current = candidate_path == *path;
+                    continue;
+                }
+                if let Some(creds) = read_windows_credentials_at(candidate_path) {
                     return Some(creds);
                 }
             }
+            if let Some(creds) = read_first_wsl_credentials() {
+                return Some(creds);
+            }
         }
+        #[cfg(feature = "wsl")]
         CredentialSource::Wsl { distro } => {
             let mut past_current = false;
             for candidate_distro in list_wsl_distros() {
@@ -989,6 +1082,7 @@ fn read_next_credentials_after(source: &CredentialSource) -> Option<Credentials>
     None
 }
 
+#[cfg(feature = "wsl")]
 fn is_safe_wsl_distro_name(name: &str) -> bool {
     // Distro names from WSL should only contain alphanumerics, spaces, hyphens,
     // underscores, and dots. Reject anything that looks like shell metacharacters.
@@ -999,6 +1093,7 @@ fn is_safe_wsl_distro_name(name: &str) -> bool {
             .all(|c| c.is_alphanumeric() || matches!(c, ' ' | '-' | '_' | '.'))
 }
 
+#[cfg(feature = "wsl")]
 fn list_wsl_distros() -> Vec<String> {
     let output = match run_with_timeout(
         Command::new("wsl.exe")
@@ -1034,6 +1129,7 @@ fn list_wsl_distros() -> Vec<String> {
         .collect()
 }
 
+#[cfg(feature = "wsl")]
 fn decode_wsl_text(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return String::new();
@@ -1046,6 +1142,7 @@ fn decode_wsl_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+#[cfg(feature = "wsl")]
 fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 2 || !bytes.len().is_multiple_of(2) {
         return None;
@@ -1069,6 +1166,7 @@ fn decode_utf16le(bytes: &[u8]) -> Option<String> {
     Some(String::from_utf16_lossy(&units))
 }
 
+#[cfg(feature = "wsl")]
 fn looks_like_utf16le(bytes: &[u8]) -> bool {
     let sample_len = bytes.len().min(128);
     let units = sample_len / 2;
@@ -1598,12 +1696,14 @@ mod tests {
 
     // -- is_safe_wsl_distro_name --
 
+    #[cfg(feature = "wsl")]
     #[test]
     fn is_safe_wsl_distro_name_accepts_typical_names() {
         assert!(is_safe_wsl_distro_name("Ubuntu-22.04"));
         assert!(is_safe_wsl_distro_name("Debian GNU_Linux"));
     }
 
+    #[cfg(feature = "wsl")]
     #[test]
     fn is_safe_wsl_distro_name_rejects_empty_or_shell_metacharacters() {
         assert!(!is_safe_wsl_distro_name(""));
@@ -1615,6 +1715,7 @@ mod tests {
 
     // -- decode_utf16le / looks_like_utf16le / decode_wsl_text --
 
+    #[cfg(feature = "wsl")]
     #[test]
     fn decode_wsl_text_decodes_utf16le_with_bom() {
         // 0xFF 0xFE is the little-endian UTF-16 BOM, followed by "hi" as UTF-16LE code units.
@@ -1625,14 +1726,62 @@ mod tests {
         assert_eq!(decode_wsl_text(&bytes), "hi");
     }
 
+    #[cfg(feature = "wsl")]
     #[test]
     fn decode_wsl_text_falls_back_to_utf8_for_plain_text() {
         assert_eq!(decode_wsl_text(b"present|123|456"), "present|123|456");
     }
 
+    #[cfg(feature = "wsl")]
     #[test]
     fn decode_wsl_text_handles_empty_input() {
         assert_eq!(decode_wsl_text(b""), "");
+    }
+
+    // -- claude_config_dirs_from --
+
+    fn home() -> PathBuf {
+        PathBuf::from("home").join("me")
+    }
+
+    #[test]
+    fn claude_config_dirs_defaults_to_dot_claude_under_home() {
+        let dirs = claude_config_dirs_from(None, Some(&home()));
+        assert_eq!(dirs, vec![home().join(".claude")]);
+    }
+
+    #[test]
+    fn claude_config_dirs_prefers_the_config_dir_override() {
+        let dirs = claude_config_dirs_from(Some(OsStr::new("custom-cfg")), Some(&home()));
+        assert_eq!(
+            dirs,
+            vec![PathBuf::from("custom-cfg"), home().join(".claude")]
+        );
+    }
+
+    #[test]
+    fn claude_config_dirs_ignores_blank_config_dir() {
+        let dirs = claude_config_dirs_from(Some(OsStr::new("   ")), Some(&home()));
+        assert_eq!(dirs, vec![home().join(".claude")]);
+        assert!(claude_config_dirs_from(Some(OsStr::new("")), None).is_empty());
+    }
+
+    #[test]
+    fn claude_config_dirs_trims_surrounding_whitespace() {
+        let dirs = claude_config_dirs_from(Some(OsStr::new("  custom-cfg  ")), None);
+        assert_eq!(dirs, vec![PathBuf::from("custom-cfg")]);
+    }
+
+    #[test]
+    fn claude_config_dirs_does_not_duplicate_the_default_location() {
+        let default_dir = home().join(".claude");
+        let dirs = claude_config_dirs_from(Some(default_dir.as_os_str()), Some(&home()));
+        assert_eq!(dirs, vec![default_dir]);
+    }
+
+    #[test]
+    fn claude_config_dirs_is_empty_without_home_or_override() {
+        assert!(claude_config_dirs_from(None, None).is_empty());
     }
 
     // -- parse_credentials --

@@ -35,7 +35,13 @@ It works best if you want a simple "how close am I to the limit?" display that i
 - Claude Code (CLI or App) installed and authenticated
 - Optional: Codex CLI installed and authenticated, if you want Codex usage
 
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
+### Credentials Location
+
+The monitor reads `~/.claude/.credentials.json`, or `%CLAUDE_CONFIG_DIR%\.credentials.json` if you moved your Claude Code config directory.
+
+Set `CLAUDE_CONFIG_DIR` as a **user** environment variable rather than in a terminal session, then restart the monitor.
+
+Credentials inside WSL are off by default; build with `cargo build --release --features wsl` to read them.
 
 ## Install
 
@@ -114,8 +120,8 @@ This project is **open source**, so you can inspect exactly what it does.
 
 What the app reads:
 
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
-- If needed, the same credentials file inside an installed WSL distro
+- Your local Claude Code OAuth credentials from `%CLAUDE_CONFIG_DIR%\.credentials.json` or `~/.claude/.credentials.json`
+- The same file inside a WSL distro, in a `wsl`-enabled build only
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
 
 What the app sends over the network:
@@ -144,7 +150,7 @@ What it does **not** do:
 Security hardening details:
 
 - OAuth access tokens are **zeroed from heap memory** when no longer in use, reducing exposure in crash dumps or memory inspection tools
-- WSL distro names are validated against a safe-character allowlist to reject names with shell metacharacters
+- WSL support is off by default; in a `wsl`-enabled build, distro names are validated against a safe-character allowlist to reject names with shell metacharacters
 - Symlinks on the Windows credential file and its parent directory are detected and refused, preventing symlink-based credential redirection attacks
 - Access token values are validated (ASCII-only, 1–8192 chars) to reject obviously corrupt or tampered credential files
 - Rate-limit utilization values from the API are clamped to [0, 1] to guard against NaN or malformed responses
@@ -173,7 +179,7 @@ Notes:
 
 The monitor:
 
-1. Finds your enabled model login credentials
+1. Finds your enabled model login credentials, honoring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
 2. Reads your current usage from Anthropic and/or ChatGPT
 3. Shows the result directly in the Windows taskbar
 4. Refreshes periodically in the background
