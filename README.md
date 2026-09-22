@@ -37,6 +37,14 @@ It works best if you want a simple "how close am I to the limit?" display that i
 
 If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
 
+### Custom Config Directory
+
+If you moved your Claude Code config directory with `CLAUDE_CONFIG_DIR`, the monitor follows it and looks for `%CLAUDE_CONFIG_DIR%\.credentials.json` first, then falls back to the default `~/.claude/.credentials.json`.
+
+On Windows, set `CLAUDE_CONFIG_DIR` as a **user** environment variable (Settings -> System -> About -> Advanced system settings -> Environment Variables), not just in a terminal session. The monitor runs as its own process, so it only sees variables that are set for your account, and you need to restart it after changing one.
+
+Inside WSL, the monitor resolves `CLAUDE_CONFIG_DIR` from your login shell, so exporting it from `~/.bashrc` or `~/.profile` is enough.
+
 ## Install
 
 Download the latest `claude-code-usage-monitor.exe` from the [Releases](https://github.com/Staler2019/Claude-Code-Usage-Monitor/releases) page and run it directly.
@@ -114,7 +122,7 @@ This project is **open source**, so you can inspect exactly what it does.
 
 What the app reads:
 
-- Your local Claude Code OAuth credentials from `~/.claude/.credentials.json`
+- Your local Claude Code OAuth credentials from `%CLAUDE_CONFIG_DIR%\.credentials.json` or `~/.claude/.credentials.json`
 - If needed, the same credentials file inside an installed WSL distro
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
 
@@ -173,7 +181,7 @@ Notes:
 
 The monitor:
 
-1. Finds your enabled model login credentials
+1. Finds your enabled model login credentials, honouring `CLAUDE_CONFIG_DIR` and `CODEX_HOME`
 2. Reads your current usage from Anthropic and/or ChatGPT
 3. Shows the result directly in the Windows taskbar
 4. Refreshes periodically in the background
