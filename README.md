@@ -35,7 +35,15 @@ It works best if you want a simple "how close am I to the limit?" display that i
 - Claude Code (CLI or App) installed and authenticated
 - Optional: Codex CLI installed and authenticated, if you want Codex usage
 
-If you use Claude Code through WSL, that is supported too. The monitor can read your Claude Code credentials from Windows or from your WSL environment.
+### WSL Support
+
+Reading credentials from an installed WSL distro is behind the **`wsl` build feature and is off by default**, so the released `.exe` reads Windows credentials only. The probe shells out to `wsl.exe` on every credential lookup, which costs a process spawn per poll even on machines that have no WSL installed.
+
+If you authenticate Claude Code inside WSL, build from source with the feature enabled:
+
+```
+cargo build --release --features wsl
+```
 
 ### Custom Config Directory
 
@@ -43,7 +51,7 @@ If you moved your Claude Code config directory with `CLAUDE_CONFIG_DIR`, the mon
 
 On Windows, set `CLAUDE_CONFIG_DIR` as a **user** environment variable (Settings -> System -> About -> Advanced system settings -> Environment Variables), not just in a terminal session. The monitor runs as its own process, so it only sees variables that are set for your account, and you need to restart it after changing one.
 
-Inside WSL, the monitor resolves `CLAUDE_CONFIG_DIR` from your login shell, so exporting it from `~/.bashrc` or `~/.profile` is enough.
+In a `wsl`-enabled build, the monitor resolves `CLAUDE_CONFIG_DIR` from your WSL login shell, so exporting it from `~/.bashrc` or `~/.profile` is enough.
 
 ## Install
 
@@ -123,7 +131,7 @@ This project is **open source**, so you can inspect exactly what it does.
 What the app reads:
 
 - Your local Claude Code OAuth credentials from `%CLAUDE_CONFIG_DIR%\.credentials.json` or `~/.claude/.credentials.json`
-- If needed, the same credentials file inside an installed WSL distro
+- In a `wsl`-enabled build only, the same credentials file inside an installed WSL distro
 - If Codex is enabled, your local Codex credentials from `$CODEX_HOME/auth.json` or `~/.codex/auth.json`
 
 What the app sends over the network:
@@ -152,7 +160,7 @@ What it does **not** do:
 Security hardening details:
 
 - OAuth access tokens are **zeroed from heap memory** when no longer in use, reducing exposure in crash dumps or memory inspection tools
-- WSL distro names are validated against a safe-character allowlist to reject names with shell metacharacters
+- WSL support is off by default, so the released build never launches `wsl.exe`; in a `wsl`-enabled build, distro names are validated against a safe-character allowlist to reject names with shell metacharacters
 - Symlinks on the Windows credential file and its parent directory are detected and refused, preventing symlink-based credential redirection attacks
 - Access token values are validated (ASCII-only, 1–8192 chars) to reject obviously corrupt or tampered credential files
 - Rate-limit utilization values from the API are clamped to [0, 1] to guard against NaN or malformed responses

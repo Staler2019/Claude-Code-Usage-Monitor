@@ -16,6 +16,14 @@ InternalName = "ClaudeCodeUsageMonitor"
 Comments = "https://codezeno.com.au"
 LegalCopyright = "Copyright (C) 2026 Code Zeno Pty Ltd"
 
+[features]
+default = []
+# Read Claude Code credentials from installed WSL distros as a fallback.
+# Off by default: the probe shells out to `wsl.exe` on every credential lookup,
+# which costs a process spawn per poll even on machines with no WSL at all.
+# Build with `--features wsl` to opt in.
+wsl = []
+
 [dependencies]
 ureq = { version = "2", default-features = false, features = ["native-tls", "json", "proxy-from-env"] }
 native-tls = "0.2"

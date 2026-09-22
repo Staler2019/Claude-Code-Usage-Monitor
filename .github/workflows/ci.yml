@@ -48,6 +48,11 @@ jobs:
       - name: Test
         run: cargo test --release -- --nocapture
 
+      # The `wsl` feature is off by default, so its code would otherwise never
+      # be compiled or tested here.
+      - name: Test (--all-features)
+        run: cargo test --release --all-features -- --nocapture
+
   # Formatting and lints. `clippy::zombie_processes` catches child processes that
   # are killed or dropped without being waited on (handle leaks).
   lint:
@@ -78,6 +83,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings -D clippy::zombie_processes
 
+      - name: Clippy (--all-features)
+        run: cargo clippy --all-targets --all-features -- -D warnings -D clippy::zombie_processes
+
   # Fast type-check of the Windows target from Linux (no linker needed).
   # build.rs skips winres on non-Windows hosts to make this possible.
   check-windows-target:
@@ -104,3 +112,6 @@ jobs:
 
       - name: Check (incl. tests) for x86_64-pc-windows-msvc
         run: cargo check --all-targets --target x86_64-pc-windows-msvc
+
+      - name: Check (incl. tests, --all-features) for x86_64-pc-windows-msvc
+        run: cargo check --all-targets --all-features --target x86_64-pc-windows-msvc
