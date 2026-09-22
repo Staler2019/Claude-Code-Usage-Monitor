@@ -41,15 +41,7 @@ The monitor reads `~/.claude/.credentials.json`, or `%CLAUDE_CONFIG_DIR%\.creden
 
 Set `CLAUDE_CONFIG_DIR` as a **user** environment variable rather than in a terminal session, then restart the monitor.
 
-### WSL
-
-Reading credentials from a WSL distro is **off by default**, because probing for one costs a `wsl.exe` launch on every poll. If you sign in to Claude Code inside WSL, build with the feature enabled:
-
-```
-cargo build --release --features wsl
-```
-
-Such a build picks up `CLAUDE_CONFIG_DIR` from your WSL login shell, so `~/.bashrc` or `~/.profile` is enough.
+Credentials inside WSL are off by default; build with `cargo build --release --features wsl` to read them.
 
 ## Install
 
