@@ -10,7 +10,10 @@ use sha2::{Digest, Sha256};
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HWND, WAIT_OBJECT_0, WAIT_TIMEOUT};
 use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
-use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
+use windows::Win32::UI::Shell::ShellExecuteW;
+use windows::Win32::UI::WindowsAndMessaging::{
+    MessageBoxW, IDYES, MB_ICONERROR, MB_OK, MB_YESNO, SW_SHOWNORMAL,
+};
 
 const GITHUB_API_ACCEPT: &str = "application/vnd.github+json";
 const GITHUB_API_VERSION: &str = "2022-11-28";
@@ -65,13 +68,40 @@ pub fn handle_cli_mode(args: &[String]) -> Option<i32> {
         return Some(match apply_update(target, source, pid) {
             Ok(()) => 0,
             Err(error) => {
-                show_error_message("Update failed", &error);
+                show_update_failed_message(&error);
                 1
             }
         });
     }
 
     None
+}
+
+/// URL of the latest GitHub release page, where users can download the update manually.
+pub fn release_page_url() -> String {
+    match github_repo() {
+        Ok((owner, repo)) => format!("https://github.com/{owner}/{repo}/releases/latest"),
+        Err(_) => format!(
+            "{}/releases/latest",
+            env!("CARGO_PKG_REPOSITORY").trim_end_matches('/')
+        ),
+    }
+}
+
+/// Open the latest release page in the user's default browser.
+pub fn open_release_page() {
+    let url = wide_str(&release_page_url());
+    let verb = wide_str("open");
+    unsafe {
+        let _ = ShellExecuteW(
+            HWND::default(),
+            PCWSTR::from_raw(verb.as_ptr()),
+            PCWSTR::from_raw(url.as_ptr()),
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        );
+    }
 }
 
 pub fn check_for_updates() -> Result<UpdateCheckResult, String> {
@@ -462,6 +492,27 @@ fn show_error_message(title: &str, message: &str) {
     }
 }
 
+/// Error dialog for a failed update apply, with a Yes button that opens the release page.
+fn show_update_failed_message(error: &str) {
+    let message = format!(
+        "{error}\n\nOpen the release page to download it manually?\n{}",
+        release_page_url()
+    );
+    let open = unsafe {
+        let title_wide = wide_str("Update failed");
+        let message_wide = wide_str(&message);
+        MessageBoxW(
+            HWND::default(),
+            PCWSTR::from_raw(message_wide.as_ptr()),
+            PCWSTR::from_raw(title_wide.as_ptr()),
+            MB_YESNO | MB_ICONERROR,
+        ) == IDYES
+    };
+    if open {
+        open_release_page();
+    }
+}
+
 fn wide_str(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -579,6 +630,14 @@ mod tests {
     }
 
     // -- github_repo --
+
+    #[test]
+    fn release_page_url_points_to_latest_release() {
+        assert_eq!(
+            release_page_url(),
+            "https://github.com/Staler2019/Claude-Code-Usage-Monitor/releases/latest"
+        );
+    }
 
     #[test]
     fn github_repo_parses_owner_and_repo_from_cargo_metadata() {

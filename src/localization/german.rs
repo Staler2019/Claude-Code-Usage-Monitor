@@ -23,6 +23,7 @@ pub(super) const STRINGS: Strings = Strings {
     up_to_date: "Sie verwenden bereits die neueste Version.",
     up_to_date_short: "Aktuell",
     update_failed: "Automatisches Update war nicht möglich",
+    open_release_page_prompt: "Release-Seite öffnen, um das Update manuell herunterzuladen?",
     applying_update: "Update wird installiert...",
     update_to: "Aktualisieren auf",
     update_available: "Update verfügbar",
