@@ -23,6 +23,7 @@ pub(super) const STRINGS: Strings = Strings {
     up_to_date: "既に最新バージョンです。",
     up_to_date_short: "最新です",
     update_failed: "自動更新を完了できませんでした",
+    open_release_page_prompt: "リリースページを開いて手動でダウンロードしますか？",
     applying_update: "更新を適用しています...",
     update_to: "更新先",
     update_available: "更新が利用可能です",

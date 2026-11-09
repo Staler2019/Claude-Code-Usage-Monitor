@@ -597,16 +597,30 @@ fn show_info_message(hwnd: HWND, title: &str, message: &str) {
     }
 }
 
-fn show_error_message(hwnd: HWND, title: &str, message: &str) {
-    unsafe {
-        let title_wide = native_interop::wide_str(title);
-        let message_wide = native_interop::wide_str(message);
-        let _ = MessageBoxW(
+/// Update failure dialog with a Yes button that opens the GitHub release page,
+/// so users can still download the new version manually.
+fn show_update_failed_message(hwnd: HWND, strings: Strings, error: &str) {
+    let message = format!(
+        "{}.\n\n{}\n\n{}\n{}",
+        strings.update_failed,
+        error,
+        strings.open_release_page_prompt,
+        updater::release_page_url()
+    );
+
+    let open = unsafe {
+        let title_wide = native_interop::wide_str(strings.updates);
+        let message_wide = native_interop::wide_str(&message);
+        MessageBoxW(
             hwnd,
             PCWSTR::from_raw(message_wide.as_ptr()),
             PCWSTR::from_raw(title_wide.as_ptr()),
-            MB_OK | MB_ICONERROR,
-        );
+            MB_YESNO | MB_ICONERROR,
+        ) == IDYES
+    };
+
+    if open {
+        updater::open_release_page();
     }
 }
 
@@ -739,8 +753,7 @@ fn begin_update_check(hwnd: HWND, interactive: bool) {
                 }
                 save_state_settings();
                 if interactive {
-                    let message = format!("{}.\n\n{}", strings.update_failed, error);
-                    show_error_message(hwnd, strings.updates, &message);
+                    show_update_failed_message(hwnd, strings, &error);
                 }
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
@@ -787,8 +800,7 @@ fn begin_update_apply(hwnd: HWND, release: ReleaseDescriptor) {
                         s.update_status = UpdateStatus::Available(release);
                     }
                 }
-                let message = format!("{}.\n\n{}", strings.update_failed, error);
-                show_error_message(hwnd, strings.updates, &message);
+                show_update_failed_message(hwnd, strings, &error);
                 unsafe {
                     let _ = PostMessageW(hwnd, WM_APP_UPDATE_CHECK_COMPLETE, WPARAM(0), LPARAM(0));
                 }

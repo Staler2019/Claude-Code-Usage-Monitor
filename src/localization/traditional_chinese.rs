@@ -23,6 +23,7 @@ pub(super) const STRINGS: Strings = Strings {
     up_to_date: "您已使用最新版本。",
     up_to_date_short: "已是最新",
     update_failed: "無法自動更新",
+    open_release_page_prompt: "是否開啟發佈頁面手動下載？",
     applying_update: "正在套用更新...",
     update_to: "更新至",
     update_available: "有可用更新",
