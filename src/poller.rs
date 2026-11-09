@@ -18,7 +18,7 @@ const MESSAGES_URL: &str = "https://api.anthropic.com/v1/messages";
 const CODEX_USAGE_URL: &str = "https://chatgpt.com/backend-api/wham/usage";
 const CREATE_NO_WINDOW: u32 = 0x08000000;
 
-/// How long a CLI token refresh (`claude -p .` / `codex exec .`) may run.
+/// How long a CLI token refresh (`claude -p --safe-mode .` / `codex exec .`) may run.
 const CLI_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long a `--version` / `where.exe` probe may run while locating a CLI.
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -195,7 +195,7 @@ fn cli_refresh_windows_token() {
         "attempting Windows Claude token refresh via {claude_path}"
     ));
 
-    let args: &[&str] = &["-p", "."];
+    let args: &[&str] = &["-p", "--safe-mode", "."];
 
     let mut cmd = if is_cmd {
         let mut c = Command::new("cmd.exe");
@@ -236,7 +236,7 @@ fn cli_refresh_wsl_token(distro: &str) {
         .arg("--")
         .arg("bash")
         .arg("-lic")
-        .arg("if command -v claude >/dev/null 2>&1; then claude -p .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p .; else exit 127; fi")
+        .arg("if command -v claude >/dev/null 2>&1; then claude -p --safe-mode .; elif [ -x \"$HOME/.local/bin/claude\" ]; then \"$HOME/.local/bin/claude\" -p --safe-mode .; else exit 127; fi")
         .env_remove("CLAUDECODE")
         .env_remove("CLAUDE_CODE_ENTRYPOINT")
         .creation_flags(CREATE_NO_WINDOW)
